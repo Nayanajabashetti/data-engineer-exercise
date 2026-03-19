@@ -108,7 +108,15 @@ def main():
     hits = (
         df
         .withColumn("visitor_id", F.concat_ws("|", F.col("ip"), F.col("user_agent")))
-        .withColumn("hit_ts", F.col("hit_time_gmt").cast("long"))
+        .withColumn(
+            "hit_ts",
+            # Ensure malformed/non-numeric timestamps don't become NULL,
+            # which would make window ordering unstable.
+            F.when(
+                F.col("hit_time_gmt").rlike(r"^\d+$"),
+                F.col("hit_time_gmt").cast("long"),
+            ).otherwise(F.lit(0).cast("long")),
+        )
         .withColumn("search_info", parse_search_referrer(F.col("referrer")))
     )
 
