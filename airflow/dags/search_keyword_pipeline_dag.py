@@ -23,6 +23,15 @@ AWS_CONN_ID = "aws_default"
 GLUE_JOB_NAME = "search-keyword-performance"
 S3_BUCKET = Variable.get("search_keyword_bucket", default_var="acs-keyword-revenue-nayanaj")
 S3_OUTPUT_PREFIX = "output/"
+SYNC_DB_SINKS = Variable.get("sync_db_sinks", default_var="false")
+REDSHIFT_WORKGROUP_NAME = Variable.get("redshift_workgroup_name", default_var="")
+REDSHIFT_DATABASE = Variable.get("redshift_database", default_var="")
+REDSHIFT_SECRET_ARN = Variable.get("redshift_secret_arn", default_var="")
+REDSHIFT_FACT_TABLE = Variable.get("redshift_fact_table", default_var="fact_keyword_performance")
+AURORA_CLUSTER_ARN = Variable.get("aurora_cluster_arn", default_var="")
+AURORA_DATABASE = Variable.get("aurora_database", default_var="")
+AURORA_SECRET_ARN = Variable.get("aurora_secret_arn", default_var="")
+AURORA_AI_TABLE = Variable.get("aurora_ai_table", default_var="ai_keyword_insights")
 
 
 def verify_output_exists(bucket_name: str, prefix: str, aws_conn_id: str, **context) -> None:
@@ -54,6 +63,17 @@ with DAG(
         job_name=GLUE_JOB_NAME,
         aws_conn_id=AWS_CONN_ID,
         wait_for_completion=False,
+        script_args={
+            "--sync_db_sinks": SYNC_DB_SINKS,
+            "--redshift_workgroup_name": REDSHIFT_WORKGROUP_NAME,
+            "--redshift_database": REDSHIFT_DATABASE,
+            "--redshift_secret_arn": REDSHIFT_SECRET_ARN,
+            "--redshift_fact_table": REDSHIFT_FACT_TABLE,
+            "--aurora_cluster_arn": AURORA_CLUSTER_ARN,
+            "--aurora_database": AURORA_DATABASE,
+            "--aurora_secret_arn": AURORA_SECRET_ARN,
+            "--aurora_ai_table": AURORA_AI_TABLE,
+        },
     )
 
     wait_for_glue = GlueJobSensor(
