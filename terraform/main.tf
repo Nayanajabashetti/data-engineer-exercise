@@ -110,7 +110,13 @@ resource "aws_iam_role_policy" "glue_s3_access" {
           "s3:PutObject",
           "s3:DeleteObject",
         ]
-        Resource = "${aws_s3_bucket.data.arn}/${var.output_prefix}*"
+        Resource = [
+          # Normal outputs (e.g., output/2026-03-19_SearchKeywordPerformance/...)
+          "${aws_s3_bucket.data.arn}/${var.output_prefix}*",
+          # Some Spark/S3 integrations may attempt to write a legacy folder-marker
+          # object like output_$folder$ at the bucket root.
+          "${aws_s3_bucket.data.arn}/output*",
+        ]
       }
     ]
   })
