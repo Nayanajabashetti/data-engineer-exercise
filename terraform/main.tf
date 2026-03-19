@@ -30,12 +30,16 @@ data "archive_file" "lambda_zip" {
 resource "aws_s3_bucket" "data" {
   bucket = var.bucket_name
 
-  versioning {
-    enabled = true
-  }
-
   lifecycle {
     prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "data_versioning" {
+  bucket = aws_s3_bucket.data.id
+
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
