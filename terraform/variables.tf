@@ -32,3 +32,27 @@ variable "glue_worker_count" {
   type        = number
   default     = 2
 }
+
+variable "enable_lambda" {
+  description = "Whether to deploy the S3-triggered Lambda path (recommended for small files)."
+  type        = bool
+  default     = true
+}
+
+variable "lambda_memory_size" {
+  description = "Lambda memory size in MB."
+  type        = number
+  default     = 512
+}
+
+variable "lambda_timeout_seconds" {
+  description = "Lambda timeout in seconds."
+  type        = number
+  default     = 300
+}
+
+variable "ssm_parameter_name" {
+  description = "Name of the SecureString parameter stored in SSM Parameter Store."
+  type        = string
+  default     = "/search-keyword-performance/api-key"
+}

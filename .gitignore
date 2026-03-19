@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.pycache/
 *.py[codz]
 *$py.class
 
@@ -208,6 +209,16 @@ __marimo__/
 
 # Project outputs
 output/
+*.tab
+sample_hit_data.tsv
+SearchKeywordPerformance*.tab
 
 # macOS
 .DS_Store
+
+# Terraform local state
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/lambda_payload.zip

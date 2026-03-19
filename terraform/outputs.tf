@@ -12,3 +12,13 @@ output "s3_bucket_arn" {
   description = "ARN of the S3 data bucket."
   value       = aws_s3_bucket.data.arn
 }
+
+output "lambda_function_name" {
+  description = "Name of the deployed Lambda function (if enabled)."
+  value       = var.enable_lambda ? aws_lambda_function.analyzer[0].function_name : null
+}
+
+output "ssm_parameter_name" {
+  description = "Name of the SSM SecureString parameter used by Lambda."
+  value       = var.ssm_parameter_name
+}

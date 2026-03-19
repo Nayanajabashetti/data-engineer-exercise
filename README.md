@@ -33,6 +33,8 @@ A Python application that parses Adobe Analytics hit-level data to determine how
 
 **AWS mode**: Glue ETL job reads from S3, processes with Spark across multiple workers, writes results back to S3. Handles files of any size.
 
+**Lambda mode**: S3 upload to `input/` triggers Lambda for lightweight processing and writes a `.tab` file to `output/`.
+
 ### Attribution Model
 
 For each visitor (tracked by IP + User-Agent composite key), the application remembers the most recent external search-engine referrer. When a purchase event (`event_list` contains `1`) fires, the revenue from `product_list` is attributed to that search engine and keyword. Keywords are normalized to lowercase for accurate aggregation.
@@ -82,6 +84,14 @@ This creates:
 - An S3 bucket for input/output data
 - A Glue ETL job (`glue_job.py` uploaded to S3)
 - An IAM role with least-privilege S3 + Glue permissions
+- An optional S3-triggered Lambda function (`src/lambda_handler.py`)
+
+### Store secrets in SSM Parameter Store (SecureString)
+
+Create a SecureString parameter in AWS Systems Manager Parameter Store (recommended) and keep the secret value out of source control and Terraform state.
+
+Default parameter name expected by Lambda:
+`/search-keyword-performance/api-key`
 
 ### Run the Glue Job
 
@@ -94,6 +104,38 @@ aws glue start-job-run --job-name search-keyword-performance
 ```
 
 Results appear in `s3://my-search-keyword-data/output/`.
+
+### Run the Lambda Path
+
+After Terraform deploys Lambda, uploading a file to `input/` triggers processing automatically:
+
+```bash
+aws s3 cp data.tsv s3://my-search-keyword-data/input/data.tsv
+aws s3 ls s3://my-search-keyword-data/output/ --recursive
+```
+
+The Lambda path writes a tab file directly to:
+`s3://my-search-keyword-data/output/YYYY-mm-dd_SearchKeywordPerformance.tab`
+
+## Airflow Orchestration
+
+An example Airflow DAG is provided at:
+`airflow/dags/search_keyword_pipeline_dag.py`
+
+It performs:
+1. Trigger Glue job
+2. Wait for Glue completion
+3. Verify output exists in S3
+
+### Airflow dependencies
+
+Install Amazon provider in your Airflow environment:
+
+```bash
+pip install apache-airflow-providers-amazon
+```
+
+Configure Airflow connection `aws_default` with AWS credentials/region, then trigger DAG `search_keyword_glue_pipeline`.
 
 ### Scale for Larger Files
 
@@ -126,8 +168,11 @@ Tab-delimited file sorted by Revenue (descending):
 search-keyword-performance/
 ├── README.md
 ├── requirements.txt
+├── airflow/
+│   └── dags/
+│       └── search_keyword_pipeline_dag.py # Glue orchestration DAG
 ├── terraform/
-│   ├── main.tf                    # Glue job + S3 + IAM resources
+│   ├── main.tf                    # Glue + Lambda + S3 + IAM resources
 │   ├── variables.tf               # Configurable inputs (workers, bucket)
 │   └── outputs.tf                 # Exported job name and bucket ARN
 ├── src/
