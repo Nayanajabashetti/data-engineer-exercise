@@ -6,11 +6,22 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.5"
+    }
   }
 }
 
 provider "aws" {
   region = var.aws_region
+}
+
+# Needed to package Lambda source into a zip.
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/../src"
+  output_path = "${path.module}/lambda_payload.zip"
 }
 
 # --- S3 buckets ---
@@ -41,9 +52,9 @@ resource "aws_glue_job" "analyzer" {
   }
 
   default_arguments = {
-    "--input_path"                   = "s3://${aws_s3_bucket.data.id}/${var.input_prefix}"
-    "--output_path"                  = "s3://${aws_s3_bucket.data.id}/${var.output_prefix}"
-    "--job-language"                 = "python"
+    "--input_path"                       = "s3://${aws_s3_bucket.data.id}/${var.input_prefix}"
+    "--output_path"                      = "s3://${aws_s3_bucket.data.id}/${var.output_prefix}"
+    "--job-language"                     = "python"
     "--enable-continuous-cloudwatch-log" = "true"
   }
 
@@ -121,3 +132,112 @@ resource "aws_iam_role_policy" "glue_s3_access" {
     ]
   })
 }
+
+# --- Lambda function (optional) ---
+
+resource "aws_iam_role" "lambda_role" {
+  count = var.enable_lambda ? 1 : 0
+  name  = "search-keyword-performance-lambda-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_policy" {
+  count = var.enable_lambda ? 1 : 0
+  name  = "search-keyword-performance-lambda-policy"
+  role  = aws_iam_role.lambda_role[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+        ]
+        Resource = "${aws_s3_bucket.data.arn}/${var.input_prefix}*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+        ]
+        Resource = "${aws_s3_bucket.data.arn}/${var.output_prefix}*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+        ]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_parameter_name}"
+      },
+    ]
+  })
+}
+
+resource "aws_lambda_function" "analyzer" {
+  count = var.enable_lambda ? 1 : 0
+
+  function_name = "search-keyword-performance"
+  role          = aws_iam_role.lambda_role[0].arn
+  runtime       = "python3.12"
+  handler       = "lambda_handler.handler"
+
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+
+  timeout     = var.lambda_timeout_seconds
+  memory_size = var.lambda_memory_size
+
+  environment {
+    variables = {
+      OUTPUT_PREFIX = var.output_prefix
+      API_KEY_PARAM = var.ssm_parameter_name
+    }
+  }
+}
+
+resource "aws_lambda_permission" "allow_s3_invoke" {
+  count = var.enable_lambda ? 1 : 0
+
+  statement_id  = "AllowExecutionFromS3Bucket"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.analyzer[0].function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.data.arn
+}
+
+resource "aws_s3_bucket_notification" "input_trigger" {
+  count  = var.enable_lambda ? 1 : 0
+  bucket = aws_s3_bucket.data.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.analyzer[0].arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = var.input_prefix
+  }
+
+  depends_on = [aws_lambda_permission.allow_s3_invoke]
+}
+
+data "aws_caller_identity" "current" {}
