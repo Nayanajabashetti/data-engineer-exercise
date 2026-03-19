@@ -137,6 +137,31 @@ pip install apache-airflow-providers-amazon
 
 Configure Airflow connection `aws_default` with AWS credentials/region, then trigger DAG `search_keyword_glue_pipeline`.
 
+### Airflow UI via Docker (recommended for local stability)
+
+If native Airflow webserver crashes locally on macOS, run the UI with Docker:
+
+```bash
+cd airflow
+echo "AIRFLOW_UID=$(id -u)" > .env
+docker compose up airflow-init
+docker compose up -d
+```
+
+Open:
+`http://localhost:8080`
+
+Default login:
+- username: `admin`
+- password: `admin`
+
+Stop services:
+
+```bash
+cd airflow
+docker compose down
+```
+
 ### Scale for Larger Files
 
 ```bash

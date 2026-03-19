@@ -17,7 +17,7 @@ Glue job parameters:
 
 import sys
 from datetime import date
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -72,7 +72,7 @@ def parse_search_referrer(referrer):
     for param in SEARCH_ENGINE_QUERY_PARAMS[engine_name]:
         values = query_params.get(param)
         if values:
-            keyword = unquote(values[0]).strip().lower()
+            keyword = values[0].strip().lower()
             if keyword:
                 return (engine_domain, keyword)
     return None
@@ -131,7 +131,7 @@ def main():
     purchases = (
         hits
         .filter(F.col("event_list").isNotNull())
-        .withColumn("events", F.split(F.col("event_list"), ","))
+        .withColumn("events", F.split(F.regexp_replace(F.col("event_list"), r"\s", ""), ","))
         .filter(F.array_contains(F.col("events"), "1"))
         .filter(F.col("product_list").isNotNull() & (F.col("product_list") != ""))
         .filter(F.col("last_engine").isNotNull())

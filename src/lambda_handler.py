@@ -1,8 +1,9 @@
 """
 AWS Lambda handler -- triggered by S3 PutObject events.
 
-Streams the hit-level data file directly from S3 (no disk download),
-runs the analyzer, and uploads the result back to the same bucket.
+Streams the hit-level data file directly from S3, runs the analyzer
+in-memory (rows are sorted by hit_time_gmt), and uploads the result
+back to the same bucket.
 """
 
 import codecs
@@ -10,6 +11,7 @@ import logging
 import os
 import tempfile
 from urllib.parse import unquote_plus
+from pathlib import Path
 
 import boto3
 
@@ -51,7 +53,8 @@ def handler(event: dict, context: object) -> dict:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = analyzer.write_output(records, tmpdir)
-            output_key = OUTPUT_PREFIX + output_path.name
+            input_stem = Path(key).stem or key.replace("/", "_")
+            output_key = f"{OUTPUT_PREFIX}{input_stem}_{output_path.name}"
             s3.upload_file(str(output_path), bucket, output_key)
             logger.info("Uploaded results to s3://%s/%s", bucket, output_key)
 

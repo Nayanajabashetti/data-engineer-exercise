@@ -43,6 +43,14 @@ class TestParseSearchReferrer:
         assert result.engine_domain == expected_domain
         assert result.keyword == expected_keyword
 
+    def test_google_uk_like_domain_is_parsed(self):
+        # Documents the known limitation around ccTLDs but ensures we still
+        # recognise google as the engine and extract the keyword.
+        referrer = "https://www.google.co.uk/search?q=Ipod"
+        result = SearchKeywordAnalyzer._parse_search_referrer(referrer)
+        assert result is not None
+        assert result.keyword == "ipod"
+
     def test_internal_referrer_returns_none(self):
         result = SearchKeywordAnalyzer._parse_search_referrer(
             "http://www.esshopzilla.com/product/?pid=123"
@@ -151,6 +159,46 @@ hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_c
         assert len(results) == 1
         assert results[0].keyword == "laptop"
         assert results[0].revenue == 550.0
+
+    def test_out_of_order_hits_are_sorted_by_time(self):
+        # Same as SAMPLE_DATA but with rows deliberately shuffled to be out of order.
+        data = """\
+hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_country\tpagename\tpage_url\tproduct_list\treferrer
+1254034666\t2009-09-27 06:57:46\tMozilla/5.0\t23.8.61.21\t1\tRochester\tNY\tUS\tOrder Complete\thttps://www.esshopzilla.com/checkout/?a=complete\tElectronics;Zune - 32GB;1;250;\thttps://www.esshopzilla.com/checkout/?a=confirm
+1254033280\t2009-09-27 06:34:40\tMozilla/5.0\t67.98.123.1\t\tSalem\tOR\tUS\tHome\thttp://www.esshopzilla.com\t\thttp://www.google.com/search?hl=en&q=Ipod
+1254035260\t2009-09-27 07:07:40\tMozilla/5.0\t67.98.123.1\t1\tSalem\tOR\tUS\tOrder Complete\thttps://www.esshopzilla.com/checkout/?a=complete\tElectronics;Ipod - Touch - 32GB;1;290;\thttps://www.esshopzilla.com/checkout/?a=confirm
+"""
+        analyzer = SearchKeywordAnalyzer()
+        results = analyzer.process_stream(io.StringIO(data))
+        assert len(results) == 1
+        assert results[0].engine_domain == "google.com"
+        assert results[0].keyword == "ipod"
+        assert results[0].revenue == 290.0
+
+    def test_non_numeric_hit_time_gmt_does_not_crash(self):
+        data = """\
+hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_country\tpagename\tpage_url\tproduct_list\treferrer
+bad\t2009-09-27 06:34:40\tMozilla/5.0\t10.0.0.1\t\tCity\tST\tUS\tHome\thttp://shop.com\t\thttp://www.google.com/search?q=Laptop
+1254034666\t2009-09-27 06:57:46\tMozilla/5.0\t10.0.0.1\t1\tCity\tST\tUS\tDone\thttp://shop.com/done\tComputers;Laptop;1;500;\thttp://shop.com/cart
+"""
+        analyzer = SearchKeywordAnalyzer()
+        results = analyzer.process_stream(io.StringIO(data))
+        assert len(results) == 1
+        assert results[0].keyword == "laptop"
+        assert results[0].revenue == 500.0
+
+    def test_multi_keyword_visitor_attributes_to_most_recent(self):
+        data = """\
+hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_country\tpagename\tpage_url\tproduct_list\treferrer
+1254033280\t2009-09-27 06:34:40\tMozilla/5.0\t10.0.0.1\t\tCity\tST\tUS\tHome\thttp://shop.com\t\thttp://www.google.com/search?q=ipod
+1254033380\t2009-09-27 06:36:20\tMozilla/5.0\t10.0.0.1\t\tCity\tST\tUS\tHome\thttp://shop.com\t\thttp://www.google.com/search?q=macbook
+1254034666\t2009-09-27 06:57:46\tMozilla/5.0\t10.0.0.1\t1\tCity\tST\tUS\tDone\thttp://shop.com/done\tComputers;Laptop;1;500;\thttp://shop.com/cart
+"""
+        analyzer = SearchKeywordAnalyzer()
+        results = analyzer.process_stream(io.StringIO(data))
+        assert len(results) == 1
+        assert results[0].keyword == "macbook"
+        assert results[0].revenue == 500.0
 
 
 # ── Output file ───────────────────────────────────────────────────
