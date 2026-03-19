@@ -22,12 +22,21 @@ data "archive_file" "lambda_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../src"
   output_path = "${path.module}/lambda_payload.zip"
+  excludes    = ["__pycache__/*", "*.pyc", ".DS_Store"]
 }
 
 # --- S3 buckets ---
 
 resource "aws_s3_bucket" "data" {
   bucket = var.bucket_name
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_object" "glue_script" {
@@ -168,7 +177,7 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "logs:CreateLogStream",
           "logs:PutLogEvents",
         ]
-        Resource = "*"
+        Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/search-keyword-performance:*"
       },
       {
         Effect = "Allow"

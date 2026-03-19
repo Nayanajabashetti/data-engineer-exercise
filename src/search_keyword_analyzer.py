@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import csv
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import IO, Iterable
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import IO
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +62,35 @@ class SearchKeywordAnalyzer:
     # ------------------------------------------------------------------
 
     def process_file(self, path: str | Path) -> list[RevenueRecord]:
-        """Read *path* line-by-line and return aggregated revenue records."""
+        """Read *path*, process all rows in time order, and return aggregated revenue records."""
         with open(path, encoding="utf-8") as fh:
             return self.process_stream(fh)
 
     def process_stream(self, stream: IO[str]) -> list[RevenueRecord]:
-        """Read from *stream* line-by-line and return aggregated revenue records."""
+        """Read from *stream*, sort hits by hit_time_gmt, and return aggregated revenue records.
+
+        Sorting ensures last-touch attribution is always time-ordered regardless of
+        whether the input file is pre-sorted, keeping behaviour aligned with the
+        Glue/Spark window-function implementation.
+        Sorting tolerates malformed or missing hit_time_gmt values by treating
+        them as 0, ensuring bad rows do not crash processing.
+        """
+
+        def _safe_hit_timestamp(row: dict[str, str]) -> int:
+            raw = (row.get("hit_time_gmt") or "").strip()
+            if not raw:
+                return 0
+            if raw.isdigit():
+                try:
+                    return int(raw)
+                except ValueError:
+                    return 0
+            return 0
+
         reader = csv.DictReader(stream, delimiter="\t")
-        for row in reader:
+        rows = list(reader)
+        rows.sort(key=_safe_hit_timestamp)
+        for row in rows:
             self._process_row(row)
         return self._build_sorted_results()
 
@@ -161,7 +182,7 @@ class SearchKeywordAnalyzer:
         for param in SEARCH_ENGINE_QUERY_PARAMS[engine_name]:
             values = query_params.get(param)
             if values:
-                keyword = unquote(values[0]).strip().lower()
+                keyword = values[0].strip().lower()  # parse_qs already percent-decodes
                 if keyword:
                     return SearchAttribution(engine_domain=engine_domain, keyword=keyword)
 
