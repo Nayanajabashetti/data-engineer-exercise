@@ -137,8 +137,11 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
+.venv-airflow/
+.venv-airflow29/
 env/
 venv/
 ENV/
@@ -222,3 +225,9 @@ terraform/.terraform.lock.hcl
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/lambda_payload.zip
+
+# Local Airflow runtime state
+.airflow/
+airflow/logs/
+airflow/plugins/
+airflow/airflow.db

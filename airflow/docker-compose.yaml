@@ -1,0 +1,74 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    AIRFLOW_CONN_AWS_DEFAULT: aws://?region_name=us-west-2
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ${HOME}/.aws:/home/airflow/.aws:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && \
+        airflow users create \
+          --username admin \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: scheduler
+    restart: unless-stopped
+
+volumes:
+  postgres-db-volume:
