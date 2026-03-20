@@ -15,8 +15,9 @@ Glue job parameters:
     --output_path  s3://bucket/output/
 """
 
+import re
 import sys
-from datetime import date
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from awsglue.context import GlueContext
@@ -26,6 +27,15 @@ from pyspark.context import SparkContext
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 from pyspark.sql.window import Window
+
+_PG_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_pg_identifier(name: str, label: str) -> str:
+    if not name or not _PG_IDENT.fullmatch(name):
+        raise ValueError(f"Invalid {label} identifier {name!r} (use letters, numbers, underscore; no spaces).")
+    return name
+
 
 SEARCH_ENGINE_QUERY_PARAMS = {
     "google": ["q"],
@@ -177,7 +187,7 @@ def main():
         F.round(F.col("revenue"), 2).alias("Revenue"),
     )
 
-    today = date.today().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
     output_file = f"{args['output_path'].rstrip('/')}/{today}_SearchKeywordPerformance"
 
     # Write Parquet for fast columnar reads in BI tools.
@@ -202,7 +212,11 @@ def main():
             if not user or not password:
                 raise RuntimeError("DB secret missing username/password keys.")
 
-            run_date = date.today().isoformat()
+            fact_table = _validate_pg_identifier(db_fact_table, "db_fact_table")
+            ai_table = _validate_pg_identifier(db_ai_table, "db_ai_table")
+            ai_uk = _validate_pg_identifier(f"uq_{ai_table}_engine_kw", "AI unique index name")
+
+            run_date = datetime.now(timezone.utc).date().isoformat()
             conn = pg8000.connect(
                 host=db_host,
                 port=db_port,
@@ -214,7 +228,7 @@ def main():
             cur = conn.cursor()
             cur.execute(
                 f"""
-                CREATE TABLE IF NOT EXISTS {db_fact_table} (
+                CREATE TABLE IF NOT EXISTS {fact_table} (
                     event_date DATE,
                     search_engine_domain TEXT,
                     search_keyword TEXT,
@@ -224,7 +238,7 @@ def main():
             )
             cur.execute(
                 f"""
-                CREATE TABLE IF NOT EXISTS {db_ai_table} (
+                CREATE TABLE IF NOT EXISTS {ai_table} (
                     keyword_id SERIAL PRIMARY KEY,
                     search_engine_domain TEXT,
                     search_keyword TEXT,
@@ -233,11 +247,17 @@ def main():
                 )
                 """
             )
-            cur.execute(f"DELETE FROM {db_fact_table} WHERE event_date = %s", (run_date,))
+            cur.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS {ai_uk}
+                ON {ai_table} (search_engine_domain, search_keyword)
+                """
+            )
+            cur.execute(f"DELETE FROM {fact_table} WHERE event_date = %s", (run_date,))
             for row in rows:
                 cur.execute(
                     f"""
-                    INSERT INTO {db_fact_table}
+                    INSERT INTO {fact_table}
                     (event_date, search_engine_domain, search_keyword, total_revenue)
                     VALUES (%s, %s, %s, %s)
                     """,
@@ -245,9 +265,13 @@ def main():
                 )
                 cur.execute(
                     f"""
-                    INSERT INTO {db_ai_table}
+                    INSERT INTO {ai_table}
                     (search_engine_domain, search_keyword, revenue_impact_score)
                     VALUES (%s, %s, %s)
+                    ON CONFLICT (search_engine_domain, search_keyword)
+                    DO UPDATE SET
+                      revenue_impact_score = EXCLUDED.revenue_impact_score,
+                      last_processed_at = CURRENT_TIMESTAMP
                     """,
                     (row["engine_domain"], row["keyword"], float(row["revenue"])),
                 )

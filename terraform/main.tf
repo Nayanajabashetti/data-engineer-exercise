@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.5"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
+    }
   }
 }
 
@@ -17,10 +21,34 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Needed to package Lambda source into a zip.
+# Bundle Lambda handler + pg8000 (and deps) into one zip. Requires `python3` + `pip` on the machine running terraform apply.
+resource "null_resource" "lambda_bundle" {
+  count = var.enable_lambda ? 1 : 0
+
+  triggers = {
+    py_sources = sha256(join("", [for f in sort(fileset("${path.module}/../src", "*.py")) : filesha256("${path.module}/../src/${f}")]))
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command       = <<-EOT
+      set -e
+      BUILD="${path.module}/lambda_build"
+      rm -rf "$BUILD"
+      mkdir -p "$BUILD"
+      cp -R "${path.module}/../src/"* "$BUILD/"
+      python3 -m pip install pg8000==1.31.5 -t "$BUILD" --no-cache-dir
+    EOT
+  }
+}
+
 data "archive_file" "lambda_zip" {
+  count = var.enable_lambda ? 1 : 0
+
+  depends_on = [null_resource.lambda_bundle]
+
   type        = "zip"
-  source_dir  = "${path.module}/../src"
+  source_dir  = "${path.module}/lambda_build"
   output_path = "${path.module}/lambda_payload.zip"
   excludes    = ["__pycache__/*", "*.pyc", ".DS_Store"]
 }
@@ -150,13 +178,22 @@ resource "aws_iam_role_policy" "glue_s3_access" {
           "${aws_s3_bucket.data.arn}/output*",
         ]
       }
-      ,
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "glue_secrets_read" {
+  count = var.enable_db_sinks && var.db_secret_arn != "" ? 1 : 0
+  name  = "glue-secrets-db-credentials"
+  role  = aws_iam_role.glue_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
       {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-        ]
-        Resource = "*"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = var.db_secret_arn
       }
     ]
   })
@@ -220,15 +257,32 @@ resource "aws_iam_role_policy" "lambda_policy" {
         ]
         Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_parameter_name}"
       },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-        ]
-        Resource = "*"
-      },
     ]
   })
+}
+
+resource "aws_iam_role_policy" "lambda_secrets_read" {
+  count = var.enable_lambda && var.enable_db_sinks && var.db_secret_arn != "" ? 1 : 0
+  name  = "lambda-secrets-db-credentials"
+  role  = aws_iam_role.lambda_role[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = var.db_secret_arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
+  count = var.enable_lambda && length(var.lambda_subnet_ids) > 0 && length(var.lambda_security_group_ids) > 0 ? 1 : 0
+
+  role       = aws_iam_role.lambda_role[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
 resource "aws_lambda_function" "analyzer" {
@@ -239,11 +293,19 @@ resource "aws_lambda_function" "analyzer" {
   runtime       = "python3.12"
   handler       = "lambda_handler.handler"
 
-  filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  filename         = data.archive_file.lambda_zip[0].output_path
+  source_code_hash = data.archive_file.lambda_zip[0].output_base64sha256
 
   timeout     = var.lambda_timeout_seconds
   memory_size = var.lambda_memory_size
+
+  dynamic "vpc_config" {
+    for_each = length(var.lambda_subnet_ids) > 0 && length(var.lambda_security_group_ids) > 0 ? [1] : []
+    content {
+      subnet_ids         = var.lambda_subnet_ids
+      security_group_ids = var.lambda_security_group_ids
+    }
+  }
 
   environment {
     variables = {

@@ -9,8 +9,9 @@ back to the same bucket.
 import codecs
 import logging
 import os
+import re
 import tempfile
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote_plus
 
@@ -39,6 +40,19 @@ DB_NAME = os.environ.get("DB_NAME", "")
 DB_SECRET_ARN = os.environ.get("DB_SECRET_ARN", "")
 DB_FACT_TABLE = os.environ.get("DB_FACT_TABLE", "fact_keyword_performance")
 DB_AI_TABLE = os.environ.get("DB_AI_TABLE", "ai_keyword_insights")
+
+_PG_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_pg_identifier(name: str, label: str) -> str:
+    if not name or not _PG_IDENT.fullmatch(name):
+        raise ValueError(f"Invalid {label} identifier {name!r} (use letters, numbers, underscore; no spaces).")
+    return name
+
+
+def _run_date_utc() -> str:
+    """Calendar date in UTC (aligns with Glue DB sink and Airflow verification)."""
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _load_api_key_from_ssm() -> str:
@@ -71,7 +85,7 @@ def _write_parquet(records: list, output_dir: str, input_stem: str) -> Path:
         ) from e
 
     output_path = Path(output_dir) / (
-        f"{input_stem}_{date.today().isoformat()}_SearchKeywordPerformance.parquet"
+        f"{input_stem}_{_run_date_utc()}_SearchKeywordPerformance.parquet"
     )
     table = pa.Table.from_pydict(
         {
@@ -104,6 +118,10 @@ def _sync_to_postgres(records: list, run_date: str) -> None:
         logger.warning("Postgres sink config missing; skipping DB sync.")
         return
 
+    fact_table = _validate_pg_identifier(DB_FACT_TABLE, "DB_FACT_TABLE")
+    ai_table = _validate_pg_identifier(DB_AI_TABLE, "DB_AI_TABLE")
+    ai_uk = _validate_pg_identifier(f"uq_{ai_table}_engine_kw", "AI unique index name")
+
     user, password = _load_db_credentials()
     import pg8000
 
@@ -118,7 +136,7 @@ def _sync_to_postgres(records: list, run_date: str) -> None:
     cur = conn.cursor()
     cur.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS {DB_FACT_TABLE} (
+        CREATE TABLE IF NOT EXISTS {fact_table} (
             event_date DATE,
             search_engine_domain TEXT,
             search_keyword TEXT,
@@ -128,7 +146,7 @@ def _sync_to_postgres(records: list, run_date: str) -> None:
     )
     cur.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS {DB_AI_TABLE} (
+        CREATE TABLE IF NOT EXISTS {ai_table} (
             keyword_id SERIAL PRIMARY KEY,
             search_engine_domain TEXT,
             search_keyword TEXT,
@@ -137,11 +155,17 @@ def _sync_to_postgres(records: list, run_date: str) -> None:
         )
         """
     )
-    cur.execute(f"DELETE FROM {DB_FACT_TABLE} WHERE event_date = %s", (run_date,))
+    cur.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS {ai_uk}
+        ON {ai_table} (search_engine_domain, search_keyword)
+        """
+    )
+    cur.execute(f"DELETE FROM {fact_table} WHERE event_date = %s", (run_date,))
     for rec in records:
         cur.execute(
             f"""
-            INSERT INTO {DB_FACT_TABLE}
+            INSERT INTO {fact_table}
             (event_date, search_engine_domain, search_keyword, total_revenue)
             VALUES (%s, %s, %s, %s)
             """,
@@ -149,9 +173,13 @@ def _sync_to_postgres(records: list, run_date: str) -> None:
         )
         cur.execute(
             f"""
-            INSERT INTO {DB_AI_TABLE}
+            INSERT INTO {ai_table}
             (search_engine_domain, search_keyword, revenue_impact_score)
             VALUES (%s, %s, %s)
+            ON CONFLICT (search_engine_domain, search_keyword)
+            DO UPDATE SET
+              revenue_impact_score = EXCLUDED.revenue_impact_score,
+              last_processed_at = CURRENT_TIMESTAMP
             """,
             (rec.engine_domain, rec.keyword, float(rec.revenue)),
         )
@@ -183,7 +211,7 @@ def handler(event: dict, context: object) -> dict:
         with tempfile.TemporaryDirectory() as tmpdir:
             input_stem = Path(key).stem or key.replace("/", "_")
             if SYNC_DB_SINKS:
-                run_date = date.today().isoformat()
+                run_date = _run_date_utc()
                 _sync_to_postgres(records, run_date)
                 logger.info("Synced Lambda output to configured DB sinks.")
 

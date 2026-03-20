@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -25,15 +25,7 @@ from airflow.providers.amazon.aws.sensors.glue import GlueJobSensor
 
 AWS_CONN_ID = "aws_default"
 GLUE_JOB_NAME = "search-keyword-performance"
-S3_BUCKET = Variable.get("search_keyword_bucket", default_var="acs-keyword-revenue-nayanaj")
 S3_OUTPUT_PREFIX = "output/"
-SYNC_DB_SINKS = Variable.get("sync_db_sinks", default_var="false")
-DB_HOST = Variable.get("db_host", default_var="")
-DB_PORT = Variable.get("db_port", default_var="5432")
-DB_NAME = Variable.get("db_name", default_var="")
-DB_SECRET_ARN = Variable.get("db_secret_arn", default_var="")
-DB_FACT_TABLE = Variable.get("db_fact_table", default_var="fact_keyword_performance")
-DB_AI_TABLE = Variable.get("db_ai_table", default_var="ai_keyword_insights")
 
 
 def verify_output_exists(bucket_name: str, prefix: str, aws_conn_id: str, **context) -> None:
@@ -57,7 +49,7 @@ def _validate_pg_identifier(name: str, label: str) -> str:
 def verify_db_sinks_e2e(**context) -> None:
     """
     When Variable sync_db_sinks is true, confirm Glue's DB write path worked:
-    fact rows for UTC 'today' (same convention as Glue/Lambda) and recent AI rows.
+    fact rows for the current UTC calendar date (same as Glue/Lambda DB sinks) and recent AI rows.
     Skips quietly when sync_db_sinks is false so DAGs without DB stay unchanged.
     """
     sync_raw = Variable.get("sync_db_sinks", default_var="false")
@@ -95,8 +87,7 @@ def verify_db_sinks_e2e(**context) -> None:
     if not user or not password:
         raise AirflowException("DB secret missing username/password keys.")
 
-    # Glue/Lambda use date.today().isoformat() for event_date (scheduler/worker local date).
-    run_date = date.today().isoformat()
+    run_date = datetime.now(timezone.utc).date().isoformat()
     try:
         conn = pg8000.connect(
             host=db_host,
@@ -139,8 +130,7 @@ def verify_db_sinks_e2e(**context) -> None:
 
     if fact_n < 1:
         raise AirflowException(
-            f"DB E2E check failed: no rows in {db_fact} for event_date={run_date!r} "
-            f"(Glue uses today's date in the worker timezone; align Airflow worker TZ or DAG schedule if needed)."
+            f"DB E2E check failed: no rows in {db_fact} for event_date={run_date!r} (UTC)."
         )
     if ai_recent < 1:
         raise AirflowException(
@@ -175,13 +165,13 @@ with DAG(
         aws_conn_id=AWS_CONN_ID,
         wait_for_completion=False,
         script_args={
-            "--sync_db_sinks": SYNC_DB_SINKS,
-            "--db_host": DB_HOST,
-            "--db_port": DB_PORT,
-            "--db_name": DB_NAME,
-            "--db_secret_arn": DB_SECRET_ARN,
-            "--db_fact_table": DB_FACT_TABLE,
-            "--db_ai_table": DB_AI_TABLE,
+            "--sync_db_sinks": "{{ var.value.get('sync_db_sinks', 'false') }}",
+            "--db_host": "{{ var.value.get('db_host', '') }}",
+            "--db_port": "{{ var.value.get('db_port', '5432') }}",
+            "--db_name": "{{ var.value.get('db_name', '') }}",
+            "--db_secret_arn": "{{ var.value.get('db_secret_arn', '') }}",
+            "--db_fact_table": "{{ var.value.get('db_fact_table', 'fact_keyword_performance') }}",
+            "--db_ai_table": "{{ var.value.get('db_ai_table', 'ai_keyword_insights') }}",
         },
     )
 
@@ -198,7 +188,7 @@ with DAG(
         task_id="verify_s3_output",
         python_callable=verify_output_exists,
         op_kwargs={
-            "bucket_name": S3_BUCKET,
+            "bucket_name": "{{ var.value.get('search_keyword_bucket', 'acs-keyword-revenue-nayanaj') }}",
             "prefix": S3_OUTPUT_PREFIX,
             "aws_conn_id": AWS_CONN_ID,
         },

@@ -98,3 +98,15 @@ variable "db_ai_table" {
   type        = string
   default     = "ai_keyword_insights"
 }
+
+variable "lambda_subnet_ids" {
+  description = "VPC subnet IDs for Lambda (required with security groups to reach private RDS)."
+  type        = list(string)
+  default     = []
+}
+
+variable "lambda_security_group_ids" {
+  description = "Security group IDs for Lambda ENIs (must allow egress to RDS SG on 5432)."
+  type        = list(string)
+  default     = []
+}

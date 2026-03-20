@@ -107,11 +107,19 @@ terraform plan -var="bucket_name=my-search-keyword-data"
 terraform apply -var="bucket_name=my-search-keyword-data"
 ```
 
+**Lambda packaging:** `terraform apply` runs a local `null_resource` that copies `src/` and runs `python3 -m pip install pg8000==1.31.5 -t lambda_build/`, then zips the folder. Your machine needs **`python3` + `pip`** available on `PATH`.
+
+**Private RDS + Lambda:** set `lambda_subnet_ids` and `lambda_security_group_ids` (same VPC as RDS; SG must allow egress to RDS on 5432). Terraform attaches `AWSLambdaVPCAccessExecutionRole` when both lists are non-empty.
+
+**Secrets Manager IAM:** when `enable_db_sinks=true` and `db_secret_arn` is set, Glue and Lambda roles get **`GetSecretValue` only on that ARN** (no `*`).
+
+**DB row dates / S3 `output/` day folders:** Glue and Lambda use the **UTC calendar date** for `event_date` and for `output/<YYYY-MM-DD>_SearchKeywordPerformance/` paths.
+
 This creates:
 - An S3 bucket for input/output data
 - A Glue ETL job (`glue_job.py` uploaded to S3)
-- An IAM role with least-privilege S3 + Glue permissions
-- An optional S3-triggered Lambda function (`src/lambda_handler.py`)
+- IAM roles with scoped S3 + (optional) Secrets access
+- An optional S3-triggered Lambda function (zip includes **`pg8000`** via the build step above)
 
 ### Store secrets in SSM Parameter Store (SecureString)
 
