@@ -126,6 +126,7 @@ It performs:
 1. Trigger Glue job
 2. Wait for Glue completion
 3. Verify output exists in S3
+4. Optionally verify DB sinks (`sync_db_sinks=true`; use Airflow Variable `db_verify_mode=auto` when Airflow cannot reach private RDS from your laptop)
 
 ### Airflow dependencies
 
@@ -151,13 +152,31 @@ Terraform variables (defaults keep this disabled):
 Airflow DAG variables (same names as above) are passed to `GlueJobOperator` script args.
 Set `sync_db_sinks=true` in Airflow Variables to enable DB writes from Glue runs.
 
+### Live demo checklist (end-to-end)
+
+1. **Terraform** — deploy with your real `bucket_name` and, if you use RDS sinks, `enable_db_sinks=true` plus `db_*` variables (see below).
+2. **Glue** — job already pulls `pg8000` via `--additional-python-modules` (see `terraform/main.tf`).
+3. **Lambda + Postgres** — the deployment zip is **source-only** (`src/`). For DB sync, Lambda needs **`pg8000`** at runtime:
+   ```bash
+   chmod +x scripts/build_lambda_pg_layer.sh
+   ./scripts/build_lambda_pg_layer.sh
+   aws lambda publish-layer-version --layer-name search-keyword-pg8000 \
+     --zip-file fileb://.lambda-pg-layer.zip --compatible-runtimes python3.12 --region us-west-2
+   aws lambda update-function-configuration --function-name search-keyword-performance \
+     --layers <LayerVersionArnFromPreviousCommand> --region us-west-2
+   ```
+4. **Lambda + Parquet (optional)** — attach a **pyarrow** layer or bundle `pyarrow` if you want Parquet on the Lambda path (otherwise it falls back to `.tab`).
+5. **Smoke test** — `aws s3 cp sample_hit_data.tsv s3://<bucket>/input/demo.tsv` then check CloudWatch and `s3://<bucket>/output/`.
+6. **Airflow (local)** — see Docker section below; set **Admin → Variables** (`search_keyword_bucket`, `sync_db_sinks`, `db_*`, and for laptops without RDS reachability use `db_verify_mode=auto`).
+
 ### Airflow UI via Docker (recommended for local stability)
 
 If native Airflow webserver crashes locally on macOS, run the UI with Docker:
 
 ```bash
 cd airflow
-echo "AIRFLOW_UID=$(id -u)" > .env
+# Use 50000 unless you know your host UID exists in the container (macOS UIDs often break Airflow 2.9+).
+echo "AIRFLOW_UID=50000" > .env
 docker compose up airflow-init
 docker compose up -d
 ```
