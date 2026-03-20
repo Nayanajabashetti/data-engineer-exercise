@@ -12,14 +12,35 @@ A Python application that parses Adobe Analytics hit-level data to determine how
 ## Architecture
 
 ```
-                         ┌─────────────────────────────────────────┐
-                         │            AWS Cloud                    │
-                         │                                        │
-┌──────────┐   upload    │  ┌──────────┐  trigger  ┌───────────┐  │  ┌──────────┐
-│ Hit-level │───────────▶│  │  S3      │─────────▶│ Glue Job  │──│─▶│  S3      │
-│ TSV file  │            │  │  input/  │          │ (Spark)   │  │  │  output/ │
-└──────────┘             │  └──────────┘          └───────────┘  │  └──────────┘
-                         └─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                  AWS Cloud                                        │
+│                                                                                   │
+│  ┌──────────┐ upload   ┌──────────┐  trigger   ┌─────────────┐                   │
+│  │ Hit-level │─────────▶│ S3       │──────────▶│ Lambda      │──┐                 │
+│  │ TSV file  │          │ input/   │            │ (Python)    │  │                 │
+│  └──────────┘          └────┬─────┘            └─────────────┘  │                 │
+│                             │                      │ .parquet │                 │
+│                             │ trigger              │ or .tab* │                 │
+│                             ▼                      └─────┬──────┘                 │
+│                      ┌───────────┐                     │                         │
+│                      │ Glue Job  │─────────────────────┤                         │
+│   (optional)         │ (Spark)   │                     │                         │
+│   Airflow ──────────▶└─────┬─────┘                     ▼                         │
+│   starts Glue job          │                    ┌──────────┐                    │
+│                            │                    │ S3       │                    │
+│                            └───────────────────▶│ output/  │                    │
+│                                                 │ Parquet  │                    │
+│                                                 └────┬─────┘                    │
+│                                                      │                          │
+│                           optional DB sinks          │ optional                 │
+│                           (same aggregated rows)     │ Athena / BI              │
+│                              ▼                       ▼                          │
+│                       ┌──────────────┐         ┌─────────────┐                    │
+│                       │ RDS Postgres │         │ Query       │                    │
+│                       │ fact + AI    │         │ Parquet in  │                    │
+│                       │ tables       │         │ S3 via DDL  │                    │
+│                       └──────────────┘         └─────────────┘                    │
+└──────────────────────────────────────────────────────────────────────────────────┘
 
       OR (local development)
 
@@ -29,11 +50,17 @@ A Python application that parses Adobe Analytics hit-level data to determine how
                          └──────────────────────┘            └──────────┘
 ```
 
+\*Lambda writes **Parquet** when `pyarrow` is available in the runtime; otherwise **tab-delimited** (same columns).
+
 **Local mode**: CLI accepts a file path, writes output to `./output/`.
 
-**AWS mode**: Glue ETL job reads from S3, processes with Spark across multiple workers, writes results back to S3. Handles files of any size.
+**AWS Glue mode**: Reads hit-level TSV from S3 `input/`, aggregates in Spark, writes **Parquet** under `output/<date>_SearchKeywordPerformance/`. Optional **RDS PostgreSQL** sink for BI-style tables.
 
-**Lambda mode**: S3 upload to `input/` triggers Lambda for lightweight processing and writes a `.parquet` file to `output/`.
+**AWS Lambda mode**: S3 upload to `input/` triggers lightweight processing; writes **`output/<stem>_<date>_SearchKeywordPerformance.parquet`** (or `.tab` fallback). Optional **RDS** sink (same schema intent as Glue).
+
+**Orchestration**: **Apache Airflow** DAG can start the Glue job, wait for completion, verify S3 output, and optionally verify DB sinks (see `airflow/dags/`).
+
+**Analytics on S3**: Point **Amazon Athena** (or similar) at the **Parquet** prefixes under `output/` for ad-hoc SQL without loading files locally.
 
 ### Attribution Model
 
@@ -80,11 +107,19 @@ terraform plan -var="bucket_name=my-search-keyword-data"
 terraform apply -var="bucket_name=my-search-keyword-data"
 ```
 
+**Lambda packaging:** `terraform apply` runs a local `null_resource` that copies `src/` and runs `python3 -m pip install pg8000==1.31.5 -t lambda_build/`, then zips the folder. Your machine needs **`python3` + `pip`** available on `PATH`.
+
+**Private RDS + Lambda:** set `lambda_subnet_ids` and `lambda_security_group_ids` (same VPC as RDS; SG must allow egress to RDS on 5432). Terraform attaches `AWSLambdaVPCAccessExecutionRole` when both lists are non-empty.
+
+**Secrets Manager IAM:** when `enable_db_sinks=true` and `db_secret_arn` is set, Glue and Lambda roles get **`GetSecretValue` only on that ARN** (no `*`).
+
+**DB row dates / S3 `output/` day folders:** Glue and Lambda use the **UTC calendar date** for `event_date` and for `output/<YYYY-MM-DD>_SearchKeywordPerformance/` paths.
+
 This creates:
 - An S3 bucket for input/output data
 - A Glue ETL job (`glue_job.py` uploaded to S3)
-- An IAM role with least-privilege S3 + Glue permissions
-- An optional S3-triggered Lambda function (`src/lambda_handler.py`)
+- IAM roles with scoped S3 + (optional) Secrets access
+- An optional S3-triggered Lambda function (zip includes **`pg8000`** via the build step above)
 
 ### Store secrets in SSM Parameter Store (SecureString)
 

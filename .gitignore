@@ -152,6 +152,9 @@ venv.bak/
 .lambda-pg-layer.zip
 .lambda-pg-layer/
 
+# Terraform Lambda bundle (pip install -t; recreated by apply)
+terraform/lambda_build/
+
 # Spyder project settings
 .spyderproject
 .spyproject
