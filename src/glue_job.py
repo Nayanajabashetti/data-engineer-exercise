@@ -19,7 +19,6 @@ import sys
 from datetime import date
 from urllib.parse import parse_qs, urlparse
 
-import boto3
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -107,14 +106,12 @@ def parse_product_revenue(product_list):
 def main():
     args = getResolvedOptions(sys.argv, ["JOB_NAME", "input_path", "output_path"])
     sync_db_sinks = _optional_arg("sync_db_sinks", "false").lower() == "true"
-    redshift_workgroup_name = _optional_arg("redshift_workgroup_name")
-    redshift_database = _optional_arg("redshift_database")
-    redshift_secret_arn = _optional_arg("redshift_secret_arn")
-    redshift_fact_table = _optional_arg("redshift_fact_table", "fact_keyword_performance")
-    aurora_cluster_arn = _optional_arg("aurora_cluster_arn")
-    aurora_database = _optional_arg("aurora_database")
-    aurora_secret_arn = _optional_arg("aurora_secret_arn")
-    aurora_ai_table = _optional_arg("aurora_ai_table", "ai_keyword_insights")
+    db_host = _optional_arg("db_host")
+    db_port = int(_optional_arg("db_port", "5432"))
+    db_name = _optional_arg("db_name")
+    db_secret_arn = _optional_arg("db_secret_arn")
+    db_fact_table = _optional_arg("db_fact_table", "fact_keyword_performance")
+    db_ai_table = _optional_arg("db_ai_table", "ai_keyword_insights")
 
     sc = SparkContext()
     glue_context = GlueContext(sc)
@@ -190,80 +187,73 @@ def main():
     if sync_db_sinks:
         rows = result.collect()
         if rows:
-            redshift_data = boto3.client("redshift-data")
-            rds_data = boto3.client("rds-data")
+            if not (db_host and db_name and db_secret_arn):
+                raise RuntimeError("DB sink enabled but db_host/db_name/db_secret_arn not configured.")
+
+            import json
+            import boto3
+            import pg8000
+
+            secrets = boto3.client("secretsmanager")
+            secret_value = secrets.get_secret_value(SecretId=db_secret_arn)
+            payload = json.loads(secret_value.get("SecretString", "{}"))
+            user = payload.get("username")
+            password = payload.get("password")
+            if not user or not password:
+                raise RuntimeError("DB secret missing username/password keys.")
+
             run_date = date.today().isoformat()
-
-            if redshift_workgroup_name and redshift_database and redshift_secret_arn:
-                redshift_data.execute_statement(
-                    WorkgroupName=redshift_workgroup_name,
-                    Database=redshift_database,
-                    SecretArn=redshift_secret_arn,
-                    Sql=f"""
-                    CREATE TABLE IF NOT EXISTS {redshift_fact_table} (
-                        event_date DATE,
-                        search_engine_domain VARCHAR(100),
-                        search_keyword VARCHAR(500),
-                        total_revenue DECIMAL(18,2)
-                    );
+            conn = pg8000.connect(
+                host=db_host,
+                port=db_port,
+                user=user,
+                password=password,
+                database=db_name,
+                timeout=20,
+            )
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {db_fact_table} (
+                    event_date DATE,
+                    search_engine_domain TEXT,
+                    search_keyword TEXT,
+                    total_revenue NUMERIC(18,2)
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {db_ai_table} (
+                    keyword_id SERIAL PRIMARY KEY,
+                    search_engine_domain TEXT,
+                    search_keyword TEXT,
+                    revenue_impact_score DOUBLE PRECISION,
+                    last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(f"DELETE FROM {db_fact_table} WHERE event_date = %s", (run_date,))
+            for row in rows:
+                cur.execute(
+                    f"""
+                    INSERT INTO {db_fact_table}
+                    (event_date, search_engine_domain, search_keyword, total_revenue)
+                    VALUES (%s, %s, %s, %s)
                     """,
+                    (run_date, row["engine_domain"], row["keyword"], float(row["revenue"])),
                 )
-                redshift_data.execute_statement(
-                    WorkgroupName=redshift_workgroup_name,
-                    Database=redshift_database,
-                    SecretArn=redshift_secret_arn,
-                    Sql=f"DELETE FROM {redshift_fact_table} WHERE event_date = :d",
-                    Parameters=[{"name": "d", "value": {"stringValue": run_date}}],
-                )
-                for row in rows:
-                    redshift_data.execute_statement(
-                        WorkgroupName=redshift_workgroup_name,
-                        Database=redshift_database,
-                        SecretArn=redshift_secret_arn,
-                        Sql=f"""
-                        INSERT INTO {redshift_fact_table}
-                        (event_date, search_engine_domain, search_keyword, total_revenue)
-                        VALUES (:d, :engine, :keyword, :revenue)
-                        """,
-                        Parameters=[
-                            {"name": "d", "value": {"stringValue": run_date}},
-                            {"name": "engine", "value": {"stringValue": row["engine_domain"]}},
-                            {"name": "keyword", "value": {"stringValue": row["keyword"]}},
-                            {"name": "revenue", "value": {"doubleValue": float(row["revenue"])}},
-                        ],
-                    )
-
-            if aurora_cluster_arn and aurora_database and aurora_secret_arn:
-                rds_data.execute_statement(
-                    resourceArn=aurora_cluster_arn,
-                    secretArn=aurora_secret_arn,
-                    database=aurora_database,
-                    sql=f"""
-                    CREATE TABLE IF NOT EXISTS {aurora_ai_table} (
-                        keyword_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                        search_engine_domain TEXT,
-                        search_keyword TEXT,
-                        revenue_impact_score DOUBLE PRECISION,
-                        last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
+                cur.execute(
+                    f"""
+                    INSERT INTO {db_ai_table}
+                    (search_engine_domain, search_keyword, revenue_impact_score)
+                    VALUES (%s, %s, %s)
                     """,
+                    (row["engine_domain"], row["keyword"], float(row["revenue"])),
                 )
-                for row in rows:
-                    rds_data.execute_statement(
-                        resourceArn=aurora_cluster_arn,
-                        secretArn=aurora_secret_arn,
-                        database=aurora_database,
-                        sql=f"""
-                        INSERT INTO {aurora_ai_table}
-                        (search_engine_domain, search_keyword, revenue_impact_score)
-                        VALUES (:engine, :keyword, :revenue)
-                        """,
-                        parameters=[
-                            {"name": "engine", "value": {"stringValue": row["engine_domain"]}},
-                            {"name": "keyword", "value": {"stringValue": row["keyword"]}},
-                            {"name": "revenue", "value": {"doubleValue": float(row["revenue"])}},
-                        ],
-                    )
+            conn.commit()
+            cur.close()
+            conn.close()
 
     job.commit()
 

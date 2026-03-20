@@ -139,14 +139,14 @@ Configure Airflow connection `aws_default` with AWS credentials/region, then tri
 
 ### Optional DB sink configuration (Redshift + Aurora)
 
-Both Lambda and Glue can optionally write aggregated outputs to:
-- Redshift Serverless fact table (`fact_keyword_performance` by default)
-- Aurora PostgreSQL AI table (`ai_keyword_insights` by default)
+Both Lambda and Glue can optionally write aggregated outputs to PostgreSQL (RDS):
+- BI fact table (`fact_keyword_performance` by default)
+- AI insights table (`ai_keyword_insights` by default)
 
 Terraform variables (defaults keep this disabled):
 - `enable_db_sinks`
-- `redshift_workgroup_name`, `redshift_database`, `redshift_secret_arn`, `redshift_fact_table`
-- `aurora_cluster_arn`, `aurora_database`, `aurora_secret_arn`, `aurora_ai_table`
+- `db_host`, `db_port`, `db_name`, `db_secret_arn`
+- `db_fact_table`, `db_ai_table`
 
 Airflow DAG variables (same names as above) are passed to `GlueJobOperator` script args.
 Set `sync_db_sinks=true` in Airflow Variables to enable DB writes from Glue runs.

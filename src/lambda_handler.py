@@ -29,19 +29,16 @@ logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
 ssm = boto3.client("ssm")
-redshift_data = boto3.client("redshift-data")
-rds_data = boto3.client("rds-data")
+secrets = boto3.client("secretsmanager")
 OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "output/")
 API_KEY_PARAM = os.environ.get("API_KEY_PARAM", "")
 SYNC_DB_SINKS = os.environ.get("SYNC_DB_SINKS", "false").lower() == "true"
-REDSHIFT_WORKGROUP_NAME = os.environ.get("REDSHIFT_WORKGROUP_NAME", "")
-REDSHIFT_DATABASE = os.environ.get("REDSHIFT_DATABASE", "")
-REDSHIFT_SECRET_ARN = os.environ.get("REDSHIFT_SECRET_ARN", "")
-REDSHIFT_FACT_TABLE = os.environ.get("REDSHIFT_FACT_TABLE", "fact_keyword_performance")
-AURORA_CLUSTER_ARN = os.environ.get("AURORA_CLUSTER_ARN", "")
-AURORA_DATABASE = os.environ.get("AURORA_DATABASE", "")
-AURORA_SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
-AURORA_AI_TABLE = os.environ.get("AURORA_AI_TABLE", "ai_keyword_insights")
+DB_HOST = os.environ.get("DB_HOST", "")
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ.get("DB_NAME", "")
+DB_SECRET_ARN = os.environ.get("DB_SECRET_ARN", "")
+DB_FACT_TABLE = os.environ.get("DB_FACT_TABLE", "fact_keyword_performance")
+DB_AI_TABLE = os.environ.get("DB_AI_TABLE", "ai_keyword_insights")
 
 
 def _load_api_key_from_ssm() -> str:
@@ -87,87 +84,80 @@ def _write_parquet(records: list, output_dir: str, input_stem: str) -> Path:
     return output_path
 
 
-def _sync_to_redshift(records: list, run_date: str) -> None:
-    if not (REDSHIFT_WORKGROUP_NAME and REDSHIFT_DATABASE and REDSHIFT_SECRET_ARN):
-        logger.warning("Redshift sink config missing; skipping Redshift sync.")
+def _load_db_credentials() -> tuple[str, str]:
+    secret_value = secrets.get_secret_value(SecretId=DB_SECRET_ARN)
+    secret_string = secret_value.get("SecretString", "")
+    if not secret_string:
+        raise RuntimeError("DB secret does not contain SecretString.")
+    import json
+
+    payload = json.loads(secret_string)
+    user = payload.get("username")
+    password = payload.get("password")
+    if not user or not password:
+        raise RuntimeError("DB secret missing username/password keys.")
+    return user, password
+
+
+def _sync_to_postgres(records: list, run_date: str) -> None:
+    if not (DB_HOST and DB_NAME and DB_SECRET_ARN):
+        logger.warning("Postgres sink config missing; skipping DB sync.")
         return
 
-    create_sql = f"""
-    CREATE TABLE IF NOT EXISTS {REDSHIFT_FACT_TABLE} (
-        event_date DATE,
-        search_engine_domain VARCHAR(100),
-        search_keyword VARCHAR(500),
-        total_revenue DECIMAL(18,2)
-    );
-    """
-    redshift_data.execute_statement(
-        WorkgroupName=REDSHIFT_WORKGROUP_NAME,
-        Database=REDSHIFT_DATABASE,
-        SecretArn=REDSHIFT_SECRET_ARN,
-        Sql=create_sql,
+    user, password = _load_db_credentials()
+    import pg8000
+
+    conn = pg8000.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=user,
+        password=password,
+        database=DB_NAME,
+        timeout=20,
     )
-    redshift_data.execute_statement(
-        WorkgroupName=REDSHIFT_WORKGROUP_NAME,
-        Database=REDSHIFT_DATABASE,
-        SecretArn=REDSHIFT_SECRET_ARN,
-        Sql=f"DELETE FROM {REDSHIFT_FACT_TABLE} WHERE event_date = :d",
-        Parameters=[{"name": "d", "value": {"stringValue": run_date}}],
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {DB_FACT_TABLE} (
+            event_date DATE,
+            search_engine_domain TEXT,
+            search_keyword TEXT,
+            total_revenue NUMERIC(18,2)
+        )
+        """
     )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {DB_AI_TABLE} (
+            keyword_id SERIAL PRIMARY KEY,
+            search_engine_domain TEXT,
+            search_keyword TEXT,
+            revenue_impact_score DOUBLE PRECISION,
+            last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cur.execute(f"DELETE FROM {DB_FACT_TABLE} WHERE event_date = %s", (run_date,))
     for rec in records:
-        redshift_data.execute_statement(
-            WorkgroupName=REDSHIFT_WORKGROUP_NAME,
-            Database=REDSHIFT_DATABASE,
-            SecretArn=REDSHIFT_SECRET_ARN,
-            Sql=f"""
-            INSERT INTO {REDSHIFT_FACT_TABLE}
+        cur.execute(
+            f"""
+            INSERT INTO {DB_FACT_TABLE}
             (event_date, search_engine_domain, search_keyword, total_revenue)
-            VALUES (:d, :engine, :keyword, :revenue)
+            VALUES (%s, %s, %s, %s)
             """,
-            Parameters=[
-                {"name": "d", "value": {"stringValue": run_date}},
-                {"name": "engine", "value": {"stringValue": rec.engine_domain}},
-                {"name": "keyword", "value": {"stringValue": rec.keyword}},
-                {"name": "revenue", "value": {"doubleValue": float(rec.revenue)}},
-            ],
+            (run_date, rec.engine_domain, rec.keyword, float(rec.revenue)),
         )
-
-
-def _sync_to_aurora(records: list) -> None:
-    if not (AURORA_CLUSTER_ARN and AURORA_DATABASE and AURORA_SECRET_ARN):
-        logger.warning("Aurora sink config missing; skipping Aurora sync.")
-        return
-
-    create_sql = f"""
-    CREATE TABLE IF NOT EXISTS {AURORA_AI_TABLE} (
-        keyword_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-        search_engine_domain TEXT,
-        search_keyword TEXT,
-        revenue_impact_score DOUBLE PRECISION,
-        last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-    rds_data.execute_statement(
-        resourceArn=AURORA_CLUSTER_ARN,
-        secretArn=AURORA_SECRET_ARN,
-        database=AURORA_DATABASE,
-        sql=create_sql,
-    )
-    for rec in records:
-        rds_data.execute_statement(
-            resourceArn=AURORA_CLUSTER_ARN,
-            secretArn=AURORA_SECRET_ARN,
-            database=AURORA_DATABASE,
-            sql=f"""
-            INSERT INTO {AURORA_AI_TABLE}
+        cur.execute(
+            f"""
+            INSERT INTO {DB_AI_TABLE}
             (search_engine_domain, search_keyword, revenue_impact_score)
-            VALUES (:engine, :keyword, :revenue)
+            VALUES (%s, %s, %s)
             """,
-            parameters=[
-                {"name": "engine", "value": {"stringValue": rec.engine_domain}},
-                {"name": "keyword", "value": {"stringValue": rec.keyword}},
-                {"name": "revenue", "value": {"doubleValue": float(rec.revenue)}},
-            ],
+            (rec.engine_domain, rec.keyword, float(rec.revenue)),
         )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 def handler(event: dict, context: object) -> dict:
@@ -192,15 +182,22 @@ def handler(event: dict, context: object) -> dict:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             input_stem = Path(key).stem or key.replace("/", "_")
-            output_path = _write_parquet(records, tmpdir, input_stem)
+            if SYNC_DB_SINKS:
+                run_date = date.today().isoformat()
+                _sync_to_postgres(records, run_date)
+                logger.info("Synced Lambda output to configured DB sinks.")
+
+            try:
+                output_path = _write_parquet(records, tmpdir, input_stem)
+            except RuntimeError as e:
+                # Keep pipeline alive for DB sync even if Parquet dependency is unavailable.
+                logger.warning("%s Falling back to tab-delimited output.", e)
+                output_path = analyzer.write_output(records, tmpdir)
+                output_path = output_path.rename(
+                    output_path.with_name(f"{input_stem}_{output_path.name}")
+                )
             output_key = f"{OUTPUT_PREFIX}{output_path.name}"
             s3.upload_file(str(output_path), bucket, output_key)
             logger.info("Uploaded results to s3://%s/%s", bucket, output_key)
-
-            if SYNC_DB_SINKS:
-                run_date = date.today().isoformat()
-                _sync_to_redshift(records, run_date)
-                _sync_to_aurora(records)
-                logger.info("Synced Lambda output to configured DB sinks.")
 
     return {"statusCode": 200, "body": "OK"}

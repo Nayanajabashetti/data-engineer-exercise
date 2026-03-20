@@ -58,55 +58,43 @@ variable "ssm_parameter_name" {
 }
 
 variable "enable_db_sinks" {
-  description = "Whether Lambda/Glue should also write aggregates to Redshift and Aurora via Data API."
+  description = "Whether Lambda/Glue should also write aggregates to database sinks."
   type        = bool
   default     = false
 }
 
-variable "redshift_workgroup_name" {
-  description = "Redshift Serverless workgroup name for BI sink."
+variable "db_host" {
+  description = "PostgreSQL host endpoint used by Lambda/Glue DB sink."
   type        = string
   default     = ""
 }
 
-variable "redshift_database" {
-  description = "Redshift database name for BI sink."
+variable "db_port" {
+  description = "PostgreSQL port used by Lambda/Glue DB sink."
+  type        = number
+  default     = 5432
+}
+
+variable "db_name" {
+  description = "PostgreSQL database name for DB sink."
   type        = string
   default     = ""
 }
 
-variable "redshift_secret_arn" {
-  description = "Secrets Manager ARN containing Redshift credentials for Data API."
+variable "db_secret_arn" {
+  description = "Secrets Manager ARN containing PostgreSQL username/password."
   type        = string
   default     = ""
 }
 
-variable "redshift_fact_table" {
-  description = "Target Redshift fact table for keyword performance."
+variable "db_fact_table" {
+  description = "Target PostgreSQL fact table for keyword performance."
   type        = string
   default     = "fact_keyword_performance"
 }
 
-variable "aurora_cluster_arn" {
-  description = "Aurora cluster ARN for Agentic AI sink via RDS Data API."
-  type        = string
-  default     = ""
-}
-
-variable "aurora_database" {
-  description = "Aurora database name for Agentic AI sink."
-  type        = string
-  default     = ""
-}
-
-variable "aurora_secret_arn" {
-  description = "Secrets Manager ARN containing Aurora credentials for Data API."
-  type        = string
-  default     = ""
-}
-
-variable "aurora_ai_table" {
-  description = "Target Aurora table for keyword AI insights."
+variable "db_ai_table" {
+  description = "Target PostgreSQL table for keyword AI insights."
   type        = string
   default     = "ai_keyword_insights"
 }

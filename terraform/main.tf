@@ -69,15 +69,14 @@ resource "aws_glue_job" "analyzer" {
     "--output_path"                      = "s3://${aws_s3_bucket.data.id}/${var.output_prefix}"
     "--job-language"                     = "python"
     "--enable-continuous-cloudwatch-log" = "true"
+    "--additional-python-modules"        = "pg8000==1.31.5"
     "--sync_db_sinks"                    = var.enable_db_sinks ? "true" : "false"
-    "--redshift_workgroup_name"          = var.redshift_workgroup_name
-    "--redshift_database"                = var.redshift_database
-    "--redshift_secret_arn"              = var.redshift_secret_arn
-    "--redshift_fact_table"              = var.redshift_fact_table
-    "--aurora_cluster_arn"               = var.aurora_cluster_arn
-    "--aurora_database"                  = var.aurora_database
-    "--aurora_secret_arn"                = var.aurora_secret_arn
-    "--aurora_ai_table"                  = var.aurora_ai_table
+    "--db_host"                          = var.db_host
+    "--db_port"                          = tostring(var.db_port)
+    "--db_name"                          = var.db_name
+    "--db_secret_arn"                    = var.db_secret_arn
+    "--db_fact_table"                    = var.db_fact_table
+    "--db_ai_table"                      = var.db_ai_table
   }
 
   number_of_workers = var.glue_worker_count
@@ -155,12 +154,6 @@ resource "aws_iam_role_policy" "glue_s3_access" {
       {
         Effect = "Allow"
         Action = [
-          "redshift-data:ExecuteStatement",
-          "redshift-data:BatchExecuteStatement",
-          "redshift-data:DescribeStatement",
-          "redshift-data:GetStatementResult",
-          "rds-data:ExecuteStatement",
-          "rds-data:BatchExecuteStatement",
           "secretsmanager:GetSecretValue",
         ]
         Resource = "*"
@@ -230,12 +223,6 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Effect = "Allow"
         Action = [
-          "redshift-data:ExecuteStatement",
-          "redshift-data:BatchExecuteStatement",
-          "redshift-data:DescribeStatement",
-          "redshift-data:GetStatementResult",
-          "rds-data:ExecuteStatement",
-          "rds-data:BatchExecuteStatement",
           "secretsmanager:GetSecretValue",
         ]
         Resource = "*"
@@ -263,14 +250,12 @@ resource "aws_lambda_function" "analyzer" {
       OUTPUT_PREFIX            = var.output_prefix
       API_KEY_PARAM            = var.ssm_parameter_name
       SYNC_DB_SINKS            = var.enable_db_sinks ? "true" : "false"
-      REDSHIFT_WORKGROUP_NAME  = var.redshift_workgroup_name
-      REDSHIFT_DATABASE        = var.redshift_database
-      REDSHIFT_SECRET_ARN      = var.redshift_secret_arn
-      REDSHIFT_FACT_TABLE      = var.redshift_fact_table
-      AURORA_CLUSTER_ARN       = var.aurora_cluster_arn
-      AURORA_DATABASE          = var.aurora_database
-      AURORA_SECRET_ARN        = var.aurora_secret_arn
-      AURORA_AI_TABLE          = var.aurora_ai_table
+      DB_HOST                  = var.db_host
+      DB_PORT                  = tostring(var.db_port)
+      DB_NAME                  = var.db_name
+      DB_SECRET_ARN            = var.db_secret_arn
+      DB_FACT_TABLE            = var.db_fact_table
+      DB_AI_TABLE              = var.db_ai_table
     }
   }
 }
