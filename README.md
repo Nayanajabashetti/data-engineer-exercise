@@ -12,14 +12,35 @@ A Python application that parses Adobe Analytics hit-level data to determine how
 ## Architecture
 
 ```
-                         ┌─────────────────────────────────────────┐
-                         │            AWS Cloud                    │
-                         │                                        │
-┌──────────┐   upload    │  ┌──────────┐  trigger  ┌───────────┐  │  ┌──────────┐
-│ Hit-level │───────────▶│  │  S3      │─────────▶│ Glue Job  │──│─▶│  S3      │
-│ TSV file  │            │  │  input/  │          │ (Spark)   │  │  │  output/ │
-└──────────┘             │  └──────────┘          └───────────┘  │  └──────────┘
-                         └─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                  AWS Cloud                                        │
+│                                                                                   │
+│  ┌──────────┐ upload   ┌──────────┐  trigger   ┌─────────────┐                   │
+│  │ Hit-level │─────────▶│ S3       │──────────▶│ Lambda      │──┐                 │
+│  │ TSV file  │          │ input/   │            │ (Python)    │  │                 │
+│  └──────────┘          └────┬─────┘            └─────────────┘  │                 │
+│                             │                      │ .parquet │                 │
+│                             │ trigger              │ or .tab* │                 │
+│                             ▼                      └─────┬──────┘                 │
+│                      ┌───────────┐                     │                         │
+│                      │ Glue Job  │─────────────────────┤                         │
+│   (optional)         │ (Spark)   │                     │                         │
+│   Airflow ──────────▶└─────┬─────┘                     ▼                         │
+│   starts Glue job          │                    ┌──────────┐                    │
+│                            │                    │ S3       │                    │
+│                            └───────────────────▶│ output/  │                    │
+│                                                 │ Parquet  │                    │
+│                                                 └────┬─────┘                    │
+│                                                      │                          │
+│                           optional DB sinks          │ optional                 │
+│                           (same aggregated rows)     │ Athena / BI              │
+│                              ▼                       ▼                          │
+│                       ┌──────────────┐         ┌─────────────┐                    │
+│                       │ RDS Postgres │         │ Query       │                    │
+│                       │ fact + AI    │         │ Parquet in  │                    │
+│                       │ tables       │         │ S3 via DDL  │                    │
+│                       └──────────────┘         └─────────────┘                    │
+└──────────────────────────────────────────────────────────────────────────────────┘
 
       OR (local development)
 
@@ -29,11 +50,17 @@ A Python application that parses Adobe Analytics hit-level data to determine how
                          └──────────────────────┘            └──────────┘
 ```
 
+\*Lambda writes **Parquet** when `pyarrow` is available in the runtime; otherwise **tab-delimited** (same columns).
+
 **Local mode**: CLI accepts a file path, writes output to `./output/`.
 
-**AWS mode**: Glue ETL job reads from S3, processes with Spark across multiple workers, writes results back to S3. Handles files of any size.
+**AWS Glue mode**: Reads hit-level TSV from S3 `input/`, aggregates in Spark, writes **Parquet** under `output/<date>_SearchKeywordPerformance/`. Optional **RDS PostgreSQL** sink for BI-style tables.
 
-**Lambda mode**: S3 upload to `input/` triggers Lambda for lightweight processing and writes a `.parquet` file to `output/`.
+**AWS Lambda mode**: S3 upload to `input/` triggers lightweight processing; writes **`output/<stem>_<date>_SearchKeywordPerformance.parquet`** (or `.tab` fallback). Optional **RDS** sink (same schema intent as Glue).
+
+**Orchestration**: **Apache Airflow** DAG can start the Glue job, wait for completion, verify S3 output, and optionally verify DB sinks (see `airflow/dags/`).
+
+**Analytics on S3**: Point **Amazon Athena** (or similar) at the **Parquet** prefixes under `output/` for ad-hoc SQL without loading files locally.
 
 ### Attribution Model
 
