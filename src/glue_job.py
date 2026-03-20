@@ -40,6 +40,15 @@ SEARCH_ENGINE_QUERY_PARAMS = {
 }
 
 
+def _optional_arg(name: str, default: str = "") -> str:
+    flag = f"--{name}"
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return default
+
+
 @F.udf(returnType=StructType([
     StructField("engine_domain", StringType()),
     StructField("keyword", StringType()),
@@ -96,6 +105,13 @@ def parse_product_revenue(product_list):
 
 def main():
     args = getResolvedOptions(sys.argv, ["JOB_NAME", "input_path", "output_path"])
+    sync_db_sinks = _optional_arg("sync_db_sinks", "false").lower() == "true"
+    db_host = _optional_arg("db_host")
+    db_port = int(_optional_arg("db_port", "5432"))
+    db_name = _optional_arg("db_name")
+    db_secret_arn = _optional_arg("db_secret_arn")
+    db_fact_table = _optional_arg("db_fact_table", "fact_keyword_performance")
+    db_ai_table = _optional_arg("db_ai_table", "ai_keyword_insights")
 
     sc = SparkContext()
     glue_context = GlueContext(sc)
@@ -158,13 +174,86 @@ def main():
     output = result.select(
         F.col("engine_domain").alias("Search Engine Domain"),
         F.col("keyword").alias("Search Keyword"),
-        F.format_number("revenue", 2).alias("Revenue"),
+        F.round(F.col("revenue"), 2).alias("Revenue"),
     )
 
     today = date.today().isoformat()
     output_file = f"{args['output_path'].rstrip('/')}/{today}_SearchKeywordPerformance"
 
-    output.coalesce(1).write.mode("overwrite").option("header", "true").option("delimiter", "\t").csv(output_file)
+    # Write Parquet for fast columnar reads in BI tools.
+    # Spark will create `output_file/part-*.parquet`.
+    output.write.mode("overwrite").parquet(output_file)
+
+    if sync_db_sinks:
+        rows = result.collect()
+        if rows:
+            if not (db_host and db_name and db_secret_arn):
+                raise RuntimeError("DB sink enabled but db_host/db_name/db_secret_arn not configured.")
+
+            import json
+            import boto3
+            import pg8000
+
+            secrets = boto3.client("secretsmanager")
+            secret_value = secrets.get_secret_value(SecretId=db_secret_arn)
+            payload = json.loads(secret_value.get("SecretString", "{}"))
+            user = payload.get("username")
+            password = payload.get("password")
+            if not user or not password:
+                raise RuntimeError("DB secret missing username/password keys.")
+
+            run_date = date.today().isoformat()
+            conn = pg8000.connect(
+                host=db_host,
+                port=db_port,
+                user=user,
+                password=password,
+                database=db_name,
+                timeout=20,
+            )
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {db_fact_table} (
+                    event_date DATE,
+                    search_engine_domain TEXT,
+                    search_keyword TEXT,
+                    total_revenue NUMERIC(18,2)
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {db_ai_table} (
+                    keyword_id SERIAL PRIMARY KEY,
+                    search_engine_domain TEXT,
+                    search_keyword TEXT,
+                    revenue_impact_score DOUBLE PRECISION,
+                    last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(f"DELETE FROM {db_fact_table} WHERE event_date = %s", (run_date,))
+            for row in rows:
+                cur.execute(
+                    f"""
+                    INSERT INTO {db_fact_table}
+                    (event_date, search_engine_domain, search_keyword, total_revenue)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (run_date, row["engine_domain"], row["keyword"], float(row["revenue"])),
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO {db_ai_table}
+                    (search_engine_domain, search_keyword, revenue_impact_score)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (row["engine_domain"], row["keyword"], float(row["revenue"])),
+                )
+            conn.commit()
+            cur.close()
+            conn.close()
 
     job.commit()
 

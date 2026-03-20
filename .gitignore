@@ -148,6 +148,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local Lambda layer build (pg8000 / deps); do not commit binaries
+.lambda-pg-layer.zip
+.lambda-pg-layer/
+
 # Spyder project settings
 .spyderproject
 .spyproject

@@ -7,6 +7,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
     AIRFLOW_CONN_AWS_DEFAULT: aws://?region_name=us-west-2
+    # DAG verify_db_sinks_e2e uses pg8000 to connect to RDS from the scheduler.
+    _PIP_ADDITIONAL_REQUIREMENTS: pg8000>=1.31
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
