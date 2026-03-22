@@ -21,8 +21,7 @@ Terraform / env defaults (override per deployment):
 Legacy aliases: ``input/`` ≈ landing, ``output/`` ≈ curated (set prefixes in tfvars to match).
 
 **Partition interval:** Hive ``minute=`` buckets are driven by ``PARTITION_INTERVAL_MINUTES`` / Terraform
-``partition_interval_minutes`` — see ``src/partition_time.py`` and ``docs/partition_interval.md`` (not
-hard-coded in multiple places).
+``partition_interval_minutes`` — see ``src/partition_time.py`` (not hard-coded in multiple places).
 """
 
 from __future__ import annotations

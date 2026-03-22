@@ -1,7 +1,7 @@
 """
 AWS Glue ETL job -- processes hit-level data at scale using Spark.
 
-Medallion layout (see ``docs/medallion_architecture.md`` and ``src/s3_data_layers.py``):
+Medallion layout (see ``src/s3_data_layers.py``):
   * **Landing** (``--input_path``): raw hit-level **Parquet** (default) or legacy TSV
   * **Staging** (optional ``--partitioned_hits_path``): partitioned Parquet hits (silver)
   * **Curated** (``--output_path``): aggregated keyword performance Parquet (gold)
@@ -298,7 +298,7 @@ def main():
         )
     else:
         # Glue DynamicFrame: path pruning uses `resolved_input` only. `recurse` controls S3 listing depth
-        # (see docs/glue_runtime_latency.md); false = non-recursive list (flat folders only).
+        # false = non-recursive list (flat folders only; faster when there are no subfolders).
         dyf = glue_context.create_dynamic_frame.from_options(
             connection_type="s3",
             connection_options={

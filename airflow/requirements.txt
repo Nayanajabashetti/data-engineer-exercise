@@ -1,6 +1,0 @@
-# Amazon MWAA — pip-installed on environment startup (same bucket as DAGs; path set in Terraform).
-# The Apache Airflow Amazon provider is already included with MWAA; do not pin it here unless you
-# know the exact compatible version for your Airflow runtime (see AWS MWAA docs).
-#
-# pg8000 — used by search_keyword_pipeline_dag.verify_db_sinks_e2e when Airflow Variable sync_db_sinks=true.
-pg8000>=1.31,<2

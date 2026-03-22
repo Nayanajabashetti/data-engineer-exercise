@@ -2,8 +2,7 @@
 Airflow DAG — full AWS pipeline: **Glue** → **S3 verify** → **Lambda** (optional) → **DB verify** (optional).
 
 **Data bucket (first match wins):** Airflow Variable ``search_keyword_bucket``, then env
-``SEARCH_KEYWORD_DATA_BUCKET``, then SSM ``DATA_BUCKET_SSM_PARAM`` (Terraform + ``enable_mwaa``).
-See ``docs/mwaa_ship_and_run.md``.
+``SEARCH_KEYWORD_DATA_BUCKET``, then optional SSM parameter ``DATA_BUCKET_SSM_PARAM`` (if you create it).
 
 Requires **Apache Airflow 2.x** (Jinja ``var.value.get(key, default)`` for optional Variables).
 
@@ -41,7 +40,7 @@ GLUE_JOB_NAME = "search-keyword-performance"
 # Curated (gold) layer — align with Terraform ``output_prefix`` (default ``curated/search_keyword/``).
 S3_OUTPUT_PREFIX = "curated/search_keyword/"
 
-# Must match Terraform ``var.mwaa_data_bucket_ssm_parameter_name`` (default) when MWAA is enabled.
+# Optional SSM parameter name if you store the data bucket name in Parameter Store.
 DATA_BUCKET_SSM_PARAM = "/search-keyword-performance/airflow/data_bucket_name"
 
 # Packaged next to this DAG — one-row Parquet (same schema as sample_hit_data; PyArrow not required in workers).
@@ -50,7 +49,7 @@ _LAMBDA_SMOKE_PARQUET = Path(__file__).resolve().parent / "lambda_smoke_sample.p
 
 def _resolve_data_bucket() -> str:
     """
-    Resolve the S3 *data* bucket (landing/curated), not necessarily the MWAA source bucket path.
+    Resolve the S3 *data* bucket (landing/curated).
 
     Order: Variable ``search_keyword_bucket`` → env ``SEARCH_KEYWORD_DATA_BUCKET`` → SSM parameter.
     """
@@ -79,8 +78,7 @@ def verify_output_exists(prefix: str, aws_conn_id: str, **context) -> None:
         raise AirflowException(
             "Could not resolve the S3 data bucket. Set Airflow Variable 'search_keyword_bucket', "
             "or environment variable SEARCH_KEYWORD_DATA_BUCKET on workers, "
-            f"or deploy MWAA with Terraform so SSM parameter {DATA_BUCKET_SSM_PARAM!r} exists "
-            "(see docs/mwaa_ship_and_run.md)."
+            f"or create SSM parameter {DATA_BUCKET_SSM_PARAM!r} with the bucket name."
         )
     s3 = S3Hook(aws_conn_id=aws_conn_id)
     run_date = context.get("ds")  # e.g. "2026-03-18"

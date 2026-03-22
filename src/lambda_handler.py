@@ -3,7 +3,7 @@ AWS Lambda handler -- triggered by S3 PutObject events on the **landing** layer.
 
 Streams the hit-level data file directly from S3, runs the analyzer
 in-memory (rows are sorted by hit_time_gmt), and uploads aggregated results
-to the **curated** prefix (see ``docs/medallion_architecture.md``).
+to the **curated** prefix (see ``src/s3_data_layers.py``).
 """
 
 import codecs

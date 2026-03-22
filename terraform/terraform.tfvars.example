@@ -3,11 +3,6 @@
 
 bucket_name = "your-bucket-name"
 
-# MWAA: easiest path — Terraform creates a small VPC + 2 private subnets + NAT (avoid default VPC public subnets)
-# enable_mwaa          = true
-# create_mwaa_network  = true
-# mwaa_environment_name = "search-keyword-airflow"
-
 # Optional — only if your stack differs from repo defaults:
 # input_prefix  = "landing/"
 # output_prefix = "curated/search_keyword/"

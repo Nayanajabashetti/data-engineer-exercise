@@ -12,7 +12,7 @@
 #   ./scripts/terraform_apply.sh apply --yes       # same as AUTO_APPROVE=1
 #
 # Extra args are passed to terraform (e.g. -target=...):
-#   ./scripts/terraform_apply.sh apply -var='enable_mwaa=true' -var='mwaa_vpc_id=vpc-xxx'
+#   ./scripts/terraform_apply.sh apply -var='glue_worker_count=4'
 #
 set -euo pipefail
 
