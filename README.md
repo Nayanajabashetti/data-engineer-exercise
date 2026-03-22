@@ -134,8 +134,11 @@ analyzer = SearchKeywordAnalyzer(mask_pii=False)
 
 ### Run Tests
 
+From the **repo root** (see `pytest.ini`: only `tests/` is collected — avoids picking up vendored code under `terraform/lambda_build/`):
+
 ```bash
-pytest tests/ -v
+python3 -m pip install -r requirements.txt
+python3 -m pytest -v
 ```
 
 ## AWS Deployment (Terraform)
@@ -217,16 +220,31 @@ The Lambda path writes a Parquet file directly to:
 
 ## Airflow Orchestration
 
-An example Airflow DAG is provided at:
-`airflow/dags/search_keyword_pipeline_dag.py`
+DAG file: `airflow/dags/search_keyword_pipeline_dag.py`  
+**DAG id:** `search_keyword_glue_pipeline`
 
 **Glue + S3 smoke test in AWS:** `scripts/e2e_aws.sh` (uploads sample data, runs Glue, checks curated output).
 
-It performs:
-1. Trigger Glue job
-2. Wait for Glue completion
-3. Verify output exists in S3
-4. Optionally verify DB sinks (`glue_sync_db_sinks=true` + Terraform `db_secret_arn` IAM; use `db_verify_mode=auto` when Airflow cannot reach private RDS from your laptop)
+**Task flow (in order):**
+1. Start Glue job → wait for completion  
+2. Verify curated S3 output exists for the run (`ds`-aligned `..._SearchKeywordPerformance` keys)  
+3. Optionally verify DB sinks when `glue_sync_db_sinks=true` (RDS + Secrets Manager IAM)  
+4. **Lambda smoke** (optional Parquet upload + sync invoke; skip with Variable `airflow_invoke_lambda=false`)  
+5. **`generate_bi_reports`** (last) — reads Glue Parquet under `curated/search_keyword/<ds>_SearchKeywordPerformance/`, builds HTML + JSON via `bi_reporting.py`, uploads to:
+   - `s3://<bucket>/bi-reports/<ds>/search_keyword_performance_<ds>.html`
+   - `s3://<bucket>/bi-reports/<ds>/search_keyword_performance_<ds>.json`  
+
+Report **`ds`** matches the Airflow logical date so S3 keys align with the Glue output prefix. HTML includes **Chart.js** (loaded from a CDN — open the file in a browser with internet).
+
+**Airflow-only Python helpers** (Docker bind-mount `./dags` → `/opt/airflow/dags`): `airflow/dags/src/bi_reporting.py` and `airflow/dags/src/partition_time.py` — keep in sync with `src/bi_reporting.py` / `src/partition_time.py` when you change imports or BI behavior.
+
+**Download a BI report (after a successful run):**
+
+```bash
+export BUCKET=$(cd terraform && terraform output -raw s3_bucket_name)
+export DS=2026-03-22   # same as DAG logical date
+aws s3 cp "s3://${BUCKET}/bi-reports/${DS}/search_keyword_performance_${DS}.html" ./bi-report.html
+```
 
 ### Airflow dependencies
 
@@ -236,7 +254,7 @@ For a **local** Airflow venv (optional):
 python3 -m pip install -r requirements-dev.txt
 ```
 
-Configure Airflow connection `aws_default` with AWS credentials/region, then trigger DAG `search_keyword_glue_pipeline`. Set Variable **`search_keyword_bucket`** to your S3 data bucket (or env **`SEARCH_KEYWORD_DATA_BUCKET`** on workers).
+Configure Airflow connection `aws_default` with AWS credentials/region, then trigger DAG **`search_keyword_glue_pipeline`**. Set Variable **`search_keyword_bucket`** to your S3 data bucket (or env **`SEARCH_KEYWORD_DATA_BUCKET`** on workers).
 
 ### Optional DB sink configuration (Redshift + Aurora)
 
@@ -271,7 +289,7 @@ Set **`glue_sync_db_sinks=true`** in Airflow Variables (and Terraform **`db_secr
 
 ### Airflow UI via Docker (recommended for local stability)
 
-If native Airflow webserver crashes locally on macOS, run the UI with Docker:
+If native Airflow webserver crashes locally on macOS, run the UI with Docker. **`docker-compose.yaml`** installs **`pg8000`** (DB verify task) and **`pyarrow`** (BI task reads Glue Parquet from S3) via `_PIP_ADDITIONAL_REQUIREMENTS`.
 
 ```bash
 cd airflow
@@ -331,11 +349,13 @@ Lambda (small-file path) output is written as:
 ```
 search-keyword-performance/
 ├── README.md
-├── requirements.txt          # core + E2E (small)
-├── requirements-dev.txt    # optional: PySpark + Airflow
+├── pytest.ini                 # testpaths=tests (ignore terraform/lambda_build vendored tests)
+├── requirements.txt          # core + E2E (small; pyarrow aligned with Lambda zip)
+├── requirements-dev.txt      # optional: PySpark + Airflow (heavy; may need Docker on macOS)
 ├── airflow/
 │   └── dags/
-│       └── search_keyword_pipeline_dag.py # Glue orchestration DAG
+│       ├── search_keyword_pipeline_dag.py  # DAG id: search_keyword_glue_pipeline
+│       └── src/                # mounted into Airflow: bi_reporting + partition_time
 ├── terraform/
 │   ├── main.tf                    # Glue + Lambda + S3 + IAM resources
 │   ├── variables.tf               # Configurable inputs (workers, bucket)
@@ -344,11 +364,15 @@ search-keyword-performance/
 │   ├── __init__.py
 │   ├── main.py                    # CLI entry point (local)
 │   ├── search_keyword_analyzer.py # Core analysis class (streaming)
+│   ├── bi_reporting.py            # BI HTML/JSON (Chart.js summary; used by Airflow task)
+│   ├── partition_time.py          # Hive-style dt/hour/minute helpers
 │   ├── glue_job.py                # AWS Glue ETL job (Spark, scales to 10GB+)
 │   └── lambda_handler.py          # Lightweight Lambda handler (small files)
 └── tests/
     ├── __init__.py
-    └── test_search_keyword_analyzer.py
+    ├── test_search_keyword_analyzer.py
+    ├── test_partition_time.py
+    └── test_s3_data_layers.py
 ```
 
 ## Scalability Considerations (10 GB+ files)
