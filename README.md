@@ -80,7 +80,7 @@ See **`src/s3_data_layers.py`**. Terraform defaults use these prefixes; set `inp
 
 **Compaction:** Run a separate scheduled job to merge many small Parquet parts if needed.
 
-**Orchestration**: **Apache Airflow** DAG can start the Glue job, wait for completion, verify S3 output under the **curated** prefix, and optionally verify DB sinks (see `airflow/dags/`). Set Airflow Variable **`search_keyword_bucket`**; default output prefix in the DAG matches **`curated/search_keyword/`**.
+**Orchestration**: **Apache Airflow** DAG runs Glue, checks that curated files landed in S3, then (if you use RDS) can validate DB rows, then (by default) runs a small Lambda integration check, then builds BI reports — see **Airflow Orchestration** below. Set Variable **`search_keyword_bucket`**; curated prefix matches **`curated/search_keyword/`**.
 
 **Analytics on S3**: Point **Amazon Athena** (or similar) at the **curated** Parquet paths for ad-hoc SQL.
 
@@ -225,16 +225,27 @@ DAG file: `airflow/dags/search_keyword_pipeline_dag.py`
 
 **Glue + S3 smoke test in AWS:** `scripts/e2e_aws.sh` (uploads sample data, runs Glue, checks curated output).
 
-**Task flow (in order):**
-1. Start Glue job → wait for completion  
-2. Verify curated S3 output exists for the run (`ds`-aligned `..._SearchKeywordPerformance` keys)  
-3. Optionally verify DB sinks when `glue_sync_db_sinks=true` (RDS + Secrets Manager IAM)  
-4. **Lambda smoke** (optional Parquet upload + sync invoke; skip with Variable `airflow_invoke_lambda=false`)  
-5. **`generate_bi_reports`** (last) — reads Glue Parquet under `curated/search_keyword/<ds>_SearchKeywordPerformance/`, builds HTML + JSON via `bi_reporting.py`, uploads to:
-   - `s3://<bucket>/bi-reports/<ds>/search_keyword_performance_<ds>.html`
-   - `s3://<bucket>/bi-reports/<ds>/search_keyword_performance_<ds>.json`  
+**What runs every time (core path):**
 
-Report **`ds`** matches the Airflow logical date so S3 keys align with the Glue output prefix. HTML includes **Chart.js** (loaded from a CDN — open the file in a browser with internet).
+| Step | What it does |
+|------|----------------|
+| **1. Glue** | Starts the Glue job and waits until it finishes. |
+| **2. S3 verify** | Fails the run if Curated output is missing for this logical date (keys must contain `..._SearchKeywordPerformance...` under the curated prefix). |
+
+**What runs only when you turn that feature on:**
+
+| Step | When | What it does |
+|------|------|----------------|
+| **DB verify** | Airflow Variable **`glue_sync_db_sinks=true`** *and* RDS + `db_*` + Secrets Manager are configured | Connects to Postgres and checks that Glue wrote rows to the fact/AI tables. If **`glue_sync_db_sinks`** is **false** (default), this task **does not perform a real DB check** — it exits quickly so S3-only pipelines work without RDS. |
+| **Lambda smoke** | Airflow Variable **`airflow_invoke_lambda`** is **true** (default) | Uploads a tiny Parquet to `landing/` and invokes Lambda once to prove the serverless path works. Set to **false** to skip (e.g. Glue-only test, no Lambda in account, or to avoid extra API calls). |
+
+**What always runs last if the DAG gets that far:**
+
+| Step | What it does |
+|------|----------------|
+| **BI (`generate_bi_reports`)** | Reads Glue Parquet from `curated/search_keyword/<ds>_SearchKeywordPerformance/`, builds HTML + JSON via `bi_reporting.py`, uploads to your bucket: `s3://<your-bucket>/bi-reports/<ds>/search_keyword_performance_<ds>.html` (and `.json`). **`ds`** is the Airflow logical date (same as the Glue output folder for that run). HTML uses **Chart.js** from a CDN (browser needs internet). |
+
+**Flow in one line:** **Glue → S3 verify → DB verify (only meaningful when DB sync is enabled) → Lambda smoke (skippable via Variable) → BI reports.**
 
 **Airflow-only Python helpers** (Docker bind-mount `./dags` → `/opt/airflow/dags`): `airflow/dags/src/bi_reporting.py` and `airflow/dags/src/partition_time.py` — keep in sync with `src/bi_reporting.py` / `src/partition_time.py` when you change imports or BI behavior.
 
