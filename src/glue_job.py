@@ -81,11 +81,19 @@ SEARCH_ENGINE_QUERY_PARAMS = {
 
 
 def _optional_arg(name: str, default: str = "") -> str:
+    """
+    Read ``--name <value>`` from argv. If the token after ``--name`` is another flag
+    (starts with ``--``), treat the value as missing — Glue/Airflow often emit adjacent
+    ``--partition_hour`` ``--partition_minute`` when an optional value is empty, and
+    naive parsing would otherwise swallow ``--partition_hour`` as ``partition_minute``.
+    """
     flag = f"--{name}"
     if flag in sys.argv:
         idx = sys.argv.index(flag)
         if idx + 1 < len(sys.argv):
-            return sys.argv[idx + 1]
+            nxt = sys.argv[idx + 1]
+            if not nxt.startswith("--"):
+                return nxt
     return default
 
 

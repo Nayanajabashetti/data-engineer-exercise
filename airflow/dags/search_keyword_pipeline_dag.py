@@ -1,5 +1,5 @@
 """
-Airflow DAG — full AWS pipeline: **Glue** → **S3 verify** → **Lambda** (optional) → **DB verify** (optional).
+Airflow DAG — full AWS pipeline: **Glue** → **S3 verify** → **DB verify** (optional) → **Lambda** (optional) → **BI reports** (last).
 
 **Data bucket (first match wins):** Airflow Variable ``search_keyword_bucket``, then env
 ``SEARCH_KEYWORD_DATA_BUCKET``, then optional SSM parameter ``DATA_BUCKET_SSM_PARAM`` (if you create it).
@@ -10,11 +10,14 @@ Flow:
 1) Start Glue job
 2) Wait for Glue job completion
 3) Verify Glue output objects under curated prefix
-4) If sync_db_sinks is true: verify Postgres (Glue DB writes)
-5) Optionally upload a tiny **Parquet** file to ``landing/dt=<ds>/`` and **invoke** Lambda (same contract as S3 trigger)
+4) If ``glue_sync_db_sinks`` is true: verify Postgres (Glue DB writes)
+5) Optionally upload a tiny **Parquet** to ``landing/dt=<ds>/`` and **invoke** Lambda (smoke test), then **generate BI reports** (last step)
 
 Variables:
-- ``airflow_invoke_lambda`` — default ``true``; set ``false`` to skip step 4 (Glue-only).
+- ``glue_sync_db_sinks`` — default **off** (``false``). Set ``true`` only when Terraform grants Glue
+  ``secretsmanager:GetSecretValue`` on ``db_secret_arn`` and RDS is configured — otherwise Glue will fail on Secrets Manager.
+- ``sync_db_sinks`` — deprecated; use ``glue_sync_db_sinks`` for both Glue and DB verify.
+- ``airflow_invoke_lambda`` — default ``true``; set ``false`` to skip the Lambda smoke task.
 - ``lambda_function_name`` — default ``search-keyword-performance``.
 """
 
@@ -34,6 +37,7 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.providers.amazon.aws.sensors.glue import GlueJobSensor
+from airflow.providers.amazon.aws.operators.s3 import S3CreateObjectOperator
 
 AWS_CONN_ID = "aws_default"
 GLUE_JOB_NAME = "search-keyword-performance"
@@ -101,13 +105,12 @@ def _validate_pg_identifier(name: str, label: str) -> str:
 
 def verify_db_sinks_e2e(**context) -> None:
     """
-    When Variable sync_db_sinks is true, confirm Glue's DB write path worked:
-    fact rows for the current UTC calendar date (same as Glue/Lambda DB sinks) and recent AI rows.
-    Skips quietly when sync_db_sinks is false so DAGs without DB stay unchanged.
+    When Variable glue_sync_db_sinks is true, confirm Glue's DB write path worked.
+    Skips quietly when false so S3/Glue-only runs stay unchanged.
     """
-    sync_raw = Variable.get("sync_db_sinks", default_var="false")
+    sync_raw = Variable.get("glue_sync_db_sinks", default_var="false")
     if str(sync_raw).lower() not in ("true", "1", "yes"):
-        logging.info("sync_db_sinks disabled; skipping DB end-to-end check.")
+        logging.info("glue_sync_db_sinks disabled; skipping DB end-to-end check.")
         return
     db_verify_mode = Variable.get("db_verify_mode", default_var="auto").strip().lower()
     if db_verify_mode not in {"auto", "strict"}:
@@ -126,7 +129,7 @@ def verify_db_sinks_e2e(**context) -> None:
 
     if not all([db_host, db_name, db_secret_arn]):
         raise AirflowException(
-            "sync_db_sinks=true but db_host, db_name, or db_secret_arn Airflow Variable is empty."
+            "glue_sync_db_sinks=true but db_host, db_name, or db_secret_arn Airflow Variable is empty."
         )
 
     import boto3
@@ -198,6 +201,131 @@ def verify_db_sinks_e2e(**context) -> None:
         ai_recent,
         db_ai,
     )
+
+
+def generate_bi_reports(**context) -> None:
+    """
+    Generate comprehensive BI reports from the processed data.
+    
+    Reads the Parquet output from Glue job, generates insights, trends,
+    and recommendations, then saves reports to S3 in multiple formats.
+    """
+    import boto3
+    import tempfile
+    from pathlib import Path
+    
+    # Add src to path for BI reporter import
+    import sys
+    sys.path.insert(0, "/opt/airflow/dags/src")
+    
+    try:
+        from bi_reporting import BIReporter
+    except ImportError:
+        logging.error("BI reporting module not found. Ensure src/bi_reporting.py is available.")
+        raise AirflowException("BI reporting module not available")
+    
+    bucket = _resolve_data_bucket()
+    if not bucket:
+        raise AirflowException("Could not resolve S3 bucket for BI reports")
+    
+    ds = context.get("ds") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    # Read processed Parquet data from S3
+    s3 = S3Hook(aws_conn_id=AWS_CONN_ID)
+    s3_client = boto3.client("s3")
+    
+    # Look for today's output files
+    output_prefix = f"{S3_OUTPUT_PREFIX}{ds}_SearchKeywordPerformance/"
+    
+    try:
+        keys = s3.list_keys(bucket_name=bucket, prefix=output_prefix)
+        if not keys:
+            raise AirflowException(f"No output files found in s3://{bucket}/{output_prefix}")
+        
+        logging.info(f"Found {len(keys)} output files for BI analysis")
+        
+        # Read and aggregate data from all Parquet files
+        revenue_data = []
+        
+        for key in keys:
+            logging.info(f"Reading {key}")
+            with tempfile.NamedTemporaryFile() as tmp_file:
+                s3_client.download_file(bucket, key, tmp_file.name)
+                
+                # Read Parquet file
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(tmp_file.name)
+                    
+                    # Convert to revenue records
+                    for i in range(table.num_rows):
+                        revenue_data.append({
+                            "engine_domain": table.column("Search Engine Domain")[i].as_py(),
+                            "keyword": table.column("Search Keyword")[i].as_py(),
+                            "revenue": table.column("Revenue")[i].as_py()
+                        })
+                except ImportError:
+                    # Fallback: try to read as CSV if Parquet not available
+                    import pandas as pd
+                    df = pd.read_parquet(tmp_file.name)
+                    for _, row in df.iterrows():
+                        revenue_data.append({
+                            "engine_domain": row.get("Search Engine Domain", ""),
+                            "keyword": row.get("Search Keyword", ""),
+                            "revenue": row.get("Revenue", 0)
+                        })
+        
+        if not revenue_data:
+            raise AirflowException("No revenue data found in output files")
+        
+        logging.info(f"Processed {len(revenue_data)} revenue records")
+        
+        # Generate BI report
+        reporter = BIReporter()
+        bi_report = reporter.generate_report(
+            revenue_data=revenue_data,
+            historical_data=[],  # TODO: Load historical data for trend analysis
+            partition_info=None,  # TODO: Extract from file path
+            report_date=ds,  # align S3 keys with Glue output prefix for this run
+        )
+        
+        # Export reports in different formats
+        report_date = bi_report.report_date
+        
+        # JSON report
+        json_report = reporter.export_to_json(bi_report)
+        json_key = f"bi-reports/{report_date}/search_keyword_performance_{report_date}.json"
+        
+        # HTML report
+        html_report = reporter.export_to_html_summary(bi_report)
+        html_key = f"bi-reports/{report_date}/search_keyword_performance_{report_date}.html"
+        
+        # Upload reports to S3
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=json_key,
+            Body=json_report.encode('utf-8'),
+            ContentType='application/json'
+        )
+        
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=html_key,
+            Body=html_report.encode('utf-8'),
+            ContentType='text/html'
+        )
+        
+        logging.info(f"BI reports generated:")
+        logging.info(f"  JSON: s3://{bucket}/{json_key}")
+        logging.info(f"  HTML: s3://{bucket}/{html_key}")
+        logging.info(f"  Total Revenue: ${bi_report.total_revenue:.2f}")
+        logging.info(f"  Keywords Analyzed: {bi_report.total_keywords}")
+        logging.info(f"  Insights Generated: {len(bi_report.insights)}")
+        logging.info(f"  Recommendations: {len(bi_report.recommendations)}")
+        
+    except Exception as e:
+        logging.error(f"Failed to generate BI reports: {str(e)}")
+        raise AirflowException(f"BI report generation failed: {str(e)}")
 
 
 def invoke_lambda_pipeline(**context) -> None:
@@ -293,7 +421,8 @@ with DAG(
             "--partition_hour": "{{ var.value.get('glue_partition_hour', '') }}",
             "--partition_minute": "{{ var.value.get('glue_partition_minute', '') }}",
             "--partition_interval_minutes": "{{ var.value.get('glue_partition_interval_minutes', '15') }}",
-            "--sync_db_sinks": "{{ var.value.get('sync_db_sinks', 'false') }}",
+            # Off by default so Glue does not call Secrets Manager until Terraform IAM + db_secret_arn match.
+            "--sync_db_sinks": "{{ var.value.get('glue_sync_db_sinks', 'false') }}",
             "--db_host": "{{ var.value.get('db_host', '') }}",
             "--db_port": "{{ var.value.get('db_port', '5432') }}",
             "--db_name": "{{ var.value.get('db_name', '') }}",
@@ -328,14 +457,20 @@ with DAG(
         },
     )
 
-    invoke_lambda = PythonOperator(
-        task_id="invoke_lambda_smoke",
-        python_callable=invoke_lambda_pipeline,
-    )
-
     verify_db = PythonOperator(
         task_id="verify_db_sinks_e2e",
         python_callable=verify_db_sinks_e2e,
     )
 
-    start_glue >> wait_for_glue >> verify_output >> verify_db >> invoke_lambda
+    generate_bi = PythonOperator(
+        task_id="generate_bi_reports",
+        python_callable=generate_bi_reports,
+    )
+
+    invoke_lambda = PythonOperator(
+        task_id="invoke_lambda_smoke",
+        python_callable=invoke_lambda_pipeline,
+    )
+
+    # Lambda smoke before BI so the pipeline ends on the BI deliverable (S3 HTML/JSON).
+    start_glue >> wait_for_glue >> verify_output >> verify_db >> invoke_lambda >> generate_bi

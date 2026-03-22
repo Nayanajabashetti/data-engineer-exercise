@@ -8,7 +8,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
     AIRFLOW_CONN_AWS_DEFAULT: aws://?region_name=us-west-2
     # DAG verify_db_sinks_e2e uses pg8000 to connect to RDS from the scheduler.
-    _PIP_ADDITIONAL_REQUIREMENTS: pg8000>=1.31
+    # generate_bi_reports reads Glue Parquet from S3 — needs pyarrow (align with repo requirements.txt).
+    _PIP_ADDITIONAL_REQUIREMENTS: pg8000>=1.31 pyarrow>=17.0,<19
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
