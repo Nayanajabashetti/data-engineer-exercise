@@ -218,8 +218,10 @@ resource "aws_iam_role_policy" "glue_s3_access" {
   })
 }
 
+# Allow GetSecretValue whenever db_secret_arn is set — Airflow may pass
+# --sync_db_sinks true at runtime even if Terraform enable_db_sinks is false.
 resource "aws_iam_role_policy" "glue_secrets_read" {
-  count = var.enable_db_sinks && var.db_secret_arn != "" ? 1 : 0
+  count = var.db_secret_arn != "" ? 1 : 0
   name  = "glue-secrets-db-credentials"
   role  = aws_iam_role.glue_role.id
 
@@ -298,7 +300,7 @@ resource "aws_iam_role_policy" "lambda_policy" {
 }
 
 resource "aws_iam_role_policy" "lambda_secrets_read" {
-  count = var.enable_lambda && var.enable_db_sinks && var.db_secret_arn != "" ? 1 : 0
+  count = var.enable_lambda && var.db_secret_arn != "" ? 1 : 0
   name  = "lambda-secrets-db-credentials"
   role  = aws_iam_role.lambda_role[0].id
 

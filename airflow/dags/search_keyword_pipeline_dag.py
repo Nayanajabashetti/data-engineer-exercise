@@ -10,11 +10,14 @@ Flow:
 1) Start Glue job
 2) Wait for Glue job completion
 3) Verify Glue output objects under curated prefix
-4) If sync_db_sinks is true: verify Postgres (Glue DB writes)
+4) If ``glue_sync_db_sinks`` is true: verify Postgres (Glue DB writes)
 5) Optionally upload a tiny **Parquet** file to ``landing/dt=<ds>/`` and **invoke** Lambda (same contract as S3 trigger)
 
 Variables:
-- ``airflow_invoke_lambda`` — default ``true``; set ``false`` to skip step 4 (Glue-only).
+- ``glue_sync_db_sinks`` — default **off** (``false``). Set ``true`` only when Terraform grants Glue
+  ``secretsmanager:GetSecretValue`` on ``db_secret_arn`` and RDS is configured — otherwise Glue will fail on Secrets Manager.
+- ``sync_db_sinks`` — deprecated; use ``glue_sync_db_sinks`` for both Glue and DB verify.
+- ``airflow_invoke_lambda`` — default ``true``; set ``false`` to skip the Lambda smoke task.
 - ``lambda_function_name`` — default ``search-keyword-performance``.
 """
 
@@ -101,13 +104,12 @@ def _validate_pg_identifier(name: str, label: str) -> str:
 
 def verify_db_sinks_e2e(**context) -> None:
     """
-    When Variable sync_db_sinks is true, confirm Glue's DB write path worked:
-    fact rows for the current UTC calendar date (same as Glue/Lambda DB sinks) and recent AI rows.
-    Skips quietly when sync_db_sinks is false so DAGs without DB stay unchanged.
+    When Variable glue_sync_db_sinks is true, confirm Glue's DB write path worked.
+    Skips quietly when false so S3/Glue-only runs stay unchanged.
     """
-    sync_raw = Variable.get("sync_db_sinks", default_var="false")
+    sync_raw = Variable.get("glue_sync_db_sinks", default_var="false")
     if str(sync_raw).lower() not in ("true", "1", "yes"):
-        logging.info("sync_db_sinks disabled; skipping DB end-to-end check.")
+        logging.info("glue_sync_db_sinks disabled; skipping DB end-to-end check.")
         return
     db_verify_mode = Variable.get("db_verify_mode", default_var="auto").strip().lower()
     if db_verify_mode not in {"auto", "strict"}:
@@ -126,7 +128,7 @@ def verify_db_sinks_e2e(**context) -> None:
 
     if not all([db_host, db_name, db_secret_arn]):
         raise AirflowException(
-            "sync_db_sinks=true but db_host, db_name, or db_secret_arn Airflow Variable is empty."
+            "glue_sync_db_sinks=true but db_host, db_name, or db_secret_arn Airflow Variable is empty."
         )
 
     import boto3
@@ -293,7 +295,8 @@ with DAG(
             "--partition_hour": "{{ var.value.get('glue_partition_hour', '') }}",
             "--partition_minute": "{{ var.value.get('glue_partition_minute', '') }}",
             "--partition_interval_minutes": "{{ var.value.get('glue_partition_interval_minutes', '15') }}",
-            "--sync_db_sinks": "{{ var.value.get('sync_db_sinks', 'false') }}",
+            # Off by default so Glue does not call Secrets Manager until Terraform IAM + db_secret_arn match.
+            "--sync_db_sinks": "{{ var.value.get('glue_sync_db_sinks', 'false') }}",
             "--db_host": "{{ var.value.get('db_host', '') }}",
             "--db_port": "{{ var.value.get('db_port', '5432') }}",
             "--db_name": "{{ var.value.get('db_name', '') }}",

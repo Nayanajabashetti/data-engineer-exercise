@@ -212,7 +212,7 @@ It performs:
 1. Trigger Glue job
 2. Wait for Glue completion
 3. Verify output exists in S3
-4. Optionally verify DB sinks (`sync_db_sinks=true`; use Airflow Variable `db_verify_mode=auto` when Airflow cannot reach private RDS from your laptop)
+4. Optionally verify DB sinks (`glue_sync_db_sinks=true` + Terraform `db_secret_arn` IAM; use `db_verify_mode=auto` when Airflow cannot reach private RDS from your laptop)
 
 ### Airflow dependencies
 
@@ -236,7 +236,7 @@ Terraform variables (defaults keep this disabled):
 - `db_fact_table`, `db_ai_table`
 
 Airflow DAG variables (same names as above) are passed to `GlueJobOperator` script args.
-Set `sync_db_sinks=true` in Airflow Variables to enable DB writes from Glue runs.
+Set **`glue_sync_db_sinks=true`** in Airflow Variables (and Terraform **`db_secret_arn`**) to enable DB writes from Glue runs. Leave it **false** (default) for S3-only.
 
 ### Live demo checklist (end-to-end)
 
@@ -253,7 +253,7 @@ Set `sync_db_sinks=true` in Airflow Variables to enable DB writes from Glue runs
    ```
 4. **Lambda + Parquet (optional)** — attach a **pyarrow** layer or bundle `pyarrow` if you want Parquet on the Lambda path (otherwise it falls back to `.tab`).
 5. **Smoke test** — `aws s3 cp sample_hit_data.tsv s3://<bucket>/input/demo.tsv` then check CloudWatch and `s3://<bucket>/output/`.
-6. **Airflow (local)** — see Docker section below; set **Admin → Variables** (`search_keyword_bucket`, `sync_db_sinks`, `db_*`, and for laptops without RDS reachability use `db_verify_mode=auto`).
+6. **Airflow (local)** — see Docker section below; set **Admin → Variables** (`search_keyword_bucket`; use **`glue_sync_db_sinks`** only when RDS + IAM are ready; `db_*`; `db_verify_mode=auto` if needed).
 
 ### Airflow UI via Docker (recommended for local stability)
 

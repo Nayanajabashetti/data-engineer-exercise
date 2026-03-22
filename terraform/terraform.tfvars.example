@@ -7,7 +7,10 @@ bucket_name = "your-bucket-name"
 # input_prefix  = "landing/"
 # output_prefix = "curated/search_keyword/"
 # glue_landing_format = "parquet"   # or "tsv" for legacy tab-separated landing files
+#
+# DB sinks: set db_secret_arn to the full Secrets Manager ARN (including suffix like -AbCdEf)
+# so Glue/Lambda can call GetSecretValue. Use the same ARN as Airflow Variable db_secret_arn.
 # enable_db_sinks = true
 # db_host       = "your-rds.region.rds.amazonaws.com"
 # db_name       = "yourdb"
-# db_secret_arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:your-secret"
+# db_secret_arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:rds!db-xxxxx-YOUR_SUFFIX"

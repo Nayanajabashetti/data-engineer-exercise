@@ -136,7 +136,7 @@ variable "db_name" {
 }
 
 variable "db_secret_arn" {
-  description = "Secrets Manager ARN containing PostgreSQL username/password."
+  description = "Secrets Manager ARN for RDS/Postgres credentials. When set, Glue/Lambda IAM includes GetSecretValue on this ARN (required if Airflow or job args use sync_db_sinks with this secret)."
   type        = string
   default     = ""
 }
