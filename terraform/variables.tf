@@ -10,15 +10,27 @@ variable "bucket_name" {
 }
 
 variable "input_prefix" {
-  description = "S3 key prefix for input hit-level data files."
+  description = "Landing layer (raw / bronze): hit-level Parquet (default) or legacy TSV. Lambda trigger prefix; Glue reads from here."
   type        = string
-  default     = "input/"
+  default     = "landing/"
+}
+
+variable "staging_prefix" {
+  description = "Staging layer (silver): optional Glue output — partitioned Parquet hits (dt/hour/minute). Set empty \"\" to skip staging writes."
+  type        = string
+  default     = "staging/search_hits/"
+}
+
+variable "partition_interval_minutes" {
+  description = "Hive minute= bucket size (1–60). Must match partition_time / Lambda PARTITION_INTERVAL_MINUTES / Glue --partition_interval_minutes."
+  type        = number
+  default     = 15
 }
 
 variable "output_prefix" {
-  description = "S3 key prefix where results are written."
+  description = "Curated layer (gold / cleansed): aggregated keyword performance Parquet; Lambda writes here too."
   type        = string
-  default     = "output/"
+  default     = "curated/search_keyword/"
 }
 
 variable "glue_worker_type" {
@@ -31,6 +43,48 @@ variable "glue_worker_count" {
   description = "Number of Glue workers. Scale up for larger files."
   type        = number
   default     = 2
+}
+
+variable "glue_enable_large_job_optimizations" {
+  description = "When true, Glue job sets Spark AQE/shuffle tuning (see src/glue_job.py)."
+  type        = bool
+  default     = false
+}
+
+variable "glue_shuffle_partitions" {
+  description = "Spark spark.sql.shuffle.partitions when large-job optimizations are enabled."
+  type        = number
+  default     = 200
+}
+
+variable "glue_curated_output_partitions" {
+  description = "Number of Parquet files for curated output (1 = single file, typical for small aggregates; 8–32 for very large groupBy results)."
+  type        = number
+  default     = 1
+}
+
+variable "glue_visitor_repartition_partitions" {
+  description = "If > 0, repartition by visitor_id before window functions (0 = disabled). Try 2–4x total executor cores for huge inputs."
+  type        = number
+  default     = 0
+}
+
+variable "glue_staging_repartition_partitions" {
+  description = "If > 0 and staging prefix is set, repartition before writing silver Parquet (0 = Spark default)."
+  type        = number
+  default     = 0
+}
+
+variable "glue_s3_recursive_list" {
+  description = "Glue S3 CSV connection recurse=true (default). Set false if TSVs are only direct children of resolved_input (no nested hour=/minute= folders) to trim S3 listing."
+  type        = bool
+  default     = true
+}
+
+variable "glue_landing_format" {
+  description = "Glue landing layer format: parquet (default) or tsv (legacy tab-separated with header)."
+  type        = string
+  default     = "parquet"
 }
 
 variable "enable_lambda" {

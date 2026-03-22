@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars (gitignored) or pass -var on the CLI.
+# zsh: use single quotes for ARNs that contain !  e.g. -var='db_secret_arn=arn:...'
+
+bucket_name = "your-bucket-name"
+
+# Optional — only if your stack differs from repo defaults:
+# input_prefix  = "landing/"
+# output_prefix = "curated/search_keyword/"
+# glue_landing_format = "parquet"   # or "tsv" for legacy tab-separated landing files
+# enable_db_sinks = true
+# db_host       = "your-rds.region.rds.amazonaws.com"
+# db_name       = "yourdb"
+# db_secret_arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:your-secret"

@@ -1,19 +1,31 @@
 """
-Airflow DAG to orchestrate the search keyword pipeline via AWS Glue.
+Airflow DAG — full AWS pipeline: **Glue** → **S3 verify** → **Lambda** (optional) → **DB verify** (optional).
+
+**Data bucket (first match wins):** Airflow Variable ``search_keyword_bucket``, then env
+``SEARCH_KEYWORD_DATA_BUCKET``, then optional SSM parameter ``DATA_BUCKET_SSM_PARAM`` (if you create it).
+
+Requires **Apache Airflow 2.x** (Jinja ``var.value.get(key, default)`` for optional Variables).
 
 Flow:
 1) Start Glue job
 2) Wait for Glue job completion
-3) Verify output objects exist under s3://<bucket>/output/
-4) If sync_db_sinks is true: verify Postgres fact + AI tables received data for this run
+3) Verify Glue output objects under curated prefix
+4) If sync_db_sinks is true: verify Postgres (Glue DB writes)
+5) Optionally upload a tiny **Parquet** file to ``landing/dt=<ds>/`` and **invoke** Lambda (same contract as S3 trigger)
+
+Variables:
+- ``airflow_invoke_lambda`` — default ``true``; set ``false`` to skip step 4 (Glue-only).
+- ``lambda_function_name`` — default ``search-keyword-performance``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -25,18 +37,59 @@ from airflow.providers.amazon.aws.sensors.glue import GlueJobSensor
 
 AWS_CONN_ID = "aws_default"
 GLUE_JOB_NAME = "search-keyword-performance"
-S3_OUTPUT_PREFIX = "output/"
+# Curated (gold) layer — align with Terraform ``output_prefix`` (default ``curated/search_keyword/``).
+S3_OUTPUT_PREFIX = "curated/search_keyword/"
+
+# Optional SSM parameter name if you store the data bucket name in Parameter Store.
+DATA_BUCKET_SSM_PARAM = "/search-keyword-performance/airflow/data_bucket_name"
+
+# Packaged next to this DAG — one-row Parquet (same schema as sample_hit_data; PyArrow not required in workers).
+_LAMBDA_SMOKE_PARQUET = Path(__file__).resolve().parent / "lambda_smoke_sample.parquet"
 
 
-def verify_output_exists(bucket_name: str, prefix: str, aws_conn_id: str, **context) -> None:
+def _resolve_data_bucket() -> str:
+    """
+    Resolve the S3 *data* bucket (landing/curated).
+
+    Order: Variable ``search_keyword_bucket`` → env ``SEARCH_KEYWORD_DATA_BUCKET`` → SSM parameter.
+    """
+    v = Variable.get("search_keyword_bucket", default_var="").strip()
+    if v:
+        return v
+    env_bucket = os.environ.get("SEARCH_KEYWORD_DATA_BUCKET", "").strip()
+    if env_bucket:
+        return env_bucket
+    param = Variable.get("data_bucket_ssm_parameter", default_var="").strip() or DATA_BUCKET_SSM_PARAM
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm")
+        r = ssm.get_parameter(Name=param, WithDecryption=False)
+        return (r.get("Parameter") or {}).get("Value", "").strip()
+    except Exception as exc:
+        logging.debug("SSM lookup %s failed: %s", param, exc)
+        return ""
+
+
+def verify_output_exists(prefix: str, aws_conn_id: str, **context) -> None:
     """Fail task if no output objects for this run's date are found under the prefix."""
+    bucket_name = _resolve_data_bucket()
+    if not bucket_name:
+        raise AirflowException(
+            "Could not resolve the S3 data bucket. Set Airflow Variable 'search_keyword_bucket', "
+            "or environment variable SEARCH_KEYWORD_DATA_BUCKET on workers, "
+            f"or create SSM parameter {DATA_BUCKET_SSM_PARAM!r} with the bucket name."
+        )
     s3 = S3Hook(aws_conn_id=aws_conn_id)
     run_date = context.get("ds")  # e.g. "2026-03-18"
-    date_scoped_prefix = f"{prefix}{run_date}_SearchKeywordPerformance"
-    keys = s3.list_keys(bucket_name=bucket_name, prefix=date_scoped_prefix)
-    if not keys:
+    # Supports flat keys (output/YYYY-MM-DD_...) and partitioned keys
+    # (output/dt=.../hour=.../minute=00|15|30|45/..._YYYY-MM-DD_...).
+    needle = f"{run_date}_SearchKeywordPerformance"
+    keys = s3.list_keys(bucket_name=bucket_name, prefix=prefix) or []
+    matched = [k for k in keys if needle in k and not k.endswith("/")]
+    if not matched:
         raise AirflowException(
-            f"No output objects found in s3://{bucket_name}/{date_scoped_prefix}"
+            f"No output objects found for {needle!r} under s3://{bucket_name}/{prefix}"
         )
 
 
@@ -147,6 +200,75 @@ def verify_db_sinks_e2e(**context) -> None:
     )
 
 
+def invoke_lambda_pipeline(**context) -> None:
+    """
+    Optional: put a tiny Parquet file under landing/dt=<ds>/ and invoke the Lambda synchronously
+    (same contract as S3 PutObject → Lambda). Skipped when Variable airflow_invoke_lambda is false.
+    """
+    opt = Variable.get("airflow_invoke_lambda", default_var="true")
+    if str(opt).lower() not in ("true", "1", "yes"):
+        logging.info("airflow_invoke_lambda disabled; skipping Lambda invoke.")
+        return
+
+    bucket = _resolve_data_bucket()
+    if not bucket:
+        raise AirflowException(
+            f"Could not resolve S3 bucket for Lambda smoke (Variable search_keyword_bucket or SSM {DATA_BUCKET_SSM_PARAM})."
+        )
+
+    fn = Variable.get("lambda_function_name", default_var="search-keyword-performance").strip()
+    ds = context.get("ds") or ""
+    run_id = str(context.get("run_id") or "manual")
+    safe_rid = re.sub(r"[^a-zA-Z0-9._-]", "_", run_id)[:120]
+    key = f"landing/dt={ds}/airflow_lambda_{safe_rid}.parquet"
+
+    import boto3
+
+    if not _LAMBDA_SMOKE_PARQUET.is_file():
+        raise AirflowException(
+            f"Missing packaged Parquet for Lambda smoke: {_LAMBDA_SMOKE_PARQUET} "
+            "(sync airflow/dags/ from the repo, including lambda_smoke_sample.parquet)."
+        )
+    body = _LAMBDA_SMOKE_PARQUET.read_bytes()
+
+    region = Variable.get("aws_default_region", default_var="").strip() or None
+    s3_kw = {"region_name": region} if region else {}
+    s3c = boto3.client("s3", **s3_kw)
+    s3c.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=body,
+        ContentType="application/vnd.apache.parquet",
+    )
+    logging.info("Uploaded Lambda smoke input to s3://%s/%s", bucket, key)
+
+    payload = {
+        "Records": [
+            {
+                "eventVersion": "2.1",
+                "eventSource": "aws:s3",
+                "awsRegion": region or "",
+                "eventName": "ObjectCreated:Put",
+                "s3": {
+                    "bucket": {"name": bucket},
+                    "object": {"key": key},
+                },
+            }
+        ]
+    }
+    lam_kw = {"region_name": region} if region else {}
+    lam = boto3.client("lambda", **lam_kw)
+    resp = lam.invoke(
+        FunctionName=fn,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    raw = resp["Payload"].read().decode("utf-8", errors="replace")
+    if resp.get("FunctionError"):
+        raise AirflowException(f"Lambda {fn} failed: {raw}")
+    logging.info("Lambda %s OK: %s", fn, raw[:500])
+
+
 with DAG(
     dag_id="search_keyword_glue_pipeline",
     description="Trigger and monitor Glue job for search keyword analysis.",
@@ -165,6 +287,12 @@ with DAG(
         aws_conn_id=AWS_CONN_ID,
         wait_for_completion=False,
         script_args={
+            # Partition pruning: defaults use ds / empty so the DAG renders if Variables are missing.
+            # Optional overrides: glue_partition_dt, glue_partition_hour, glue_partition_minute.
+            "--partition_dt": "{{ var.value.get('glue_partition_dt', ds) }}",
+            "--partition_hour": "{{ var.value.get('glue_partition_hour', '') }}",
+            "--partition_minute": "{{ var.value.get('glue_partition_minute', '') }}",
+            "--partition_interval_minutes": "{{ var.value.get('glue_partition_interval_minutes', '15') }}",
             "--sync_db_sinks": "{{ var.value.get('sync_db_sinks', 'false') }}",
             "--db_host": "{{ var.value.get('db_host', '') }}",
             "--db_port": "{{ var.value.get('db_port', '5432') }}",
@@ -172,6 +300,13 @@ with DAG(
             "--db_secret_arn": "{{ var.value.get('db_secret_arn', '') }}",
             "--db_fact_table": "{{ var.value.get('db_fact_table', 'fact_keyword_performance') }}",
             "--db_ai_table": "{{ var.value.get('db_ai_table', 'ai_keyword_insights') }}",
+            # Optional Spark tuning (defaults match Terraform; override for heavy runs):
+            "--enable_large_job_optimizations": "{{ var.value.get('glue_enable_large_job_optimizations', 'false') }}",
+            "--shuffle_partitions": "{{ var.value.get('glue_shuffle_partitions', '200') }}",
+            "--curated_output_partitions": "{{ var.value.get('glue_curated_output_partitions', '1') }}",
+            "--visitor_repartition_partitions": "{{ var.value.get('glue_visitor_repartition_partitions', '0') }}",
+            "--staging_repartition_partitions": "{{ var.value.get('glue_staging_repartition_partitions', '0') }}",
+            "--s3_recursive_list": "{{ var.value.get('glue_s3_recursive_list', 'true') }}",
         },
     )
 
@@ -188,10 +323,14 @@ with DAG(
         task_id="verify_s3_output",
         python_callable=verify_output_exists,
         op_kwargs={
-            "bucket_name": "{{ var.value.get('search_keyword_bucket', 'acs-keyword-revenue-nayanaj') }}",
             "prefix": S3_OUTPUT_PREFIX,
             "aws_conn_id": AWS_CONN_ID,
         },
+    )
+
+    invoke_lambda = PythonOperator(
+        task_id="invoke_lambda_smoke",
+        python_callable=invoke_lambda_pipeline,
     )
 
     verify_db = PythonOperator(
@@ -199,4 +338,4 @@ with DAG(
         python_callable=verify_db_sinks_e2e,
     )
 
-    start_glue >> wait_for_glue >> verify_output >> verify_db
+    start_glue >> wait_for_glue >> verify_output >> verify_db >> invoke_lambda

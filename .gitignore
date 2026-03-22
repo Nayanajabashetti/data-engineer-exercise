@@ -231,7 +231,14 @@ terraform/.terraform/
 terraform/.terraform.lock.hcl
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
 terraform/lambda_payload.zip
+
+# Local AWS E2E (copy from .env.aws.example)
+.env.aws
+# E2E scripts — local TSV→Parquet temps (keep airflow/dags/lambda_smoke_sample.parquet tracked)
+.e2e_*.parquet
+.lambda_timing_*.parquet
 
 # Local Airflow runtime state
 .airflow/

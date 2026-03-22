@@ -1,7 +1,10 @@
 """Unit tests for SearchKeywordAnalyzer."""
 
 import io
+import subprocess
+import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -128,6 +131,25 @@ class TestEndToEnd:
         assert results[1].keyword == "zune"
         assert results[1].revenue == 250.0
 
+    def test_parquet_bytes_matches_tsv_sample(self, tmp_path: Path) -> None:
+        """Parquet landing path should match TSV processing for the same rows."""
+        tsv = tmp_path / "sample.tsv"
+        tsv.write_text(SAMPLE_DATA, encoding="utf-8")
+        pq_out = tmp_path / "sample.parquet"
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "tsv_to_parquet_landing.py"
+        subprocess.run(
+            [sys.executable, str(script), str(tsv), str(pq_out)],
+            check=True,
+            cwd=str(repo_root),
+        )
+        blob = pq_out.read_bytes()
+        a1 = SearchKeywordAnalyzer()
+        r1 = a1.process_stream(io.StringIO(SAMPLE_DATA))
+        a2 = SearchKeywordAnalyzer()
+        r2 = a2.process_parquet_bytes(blob)
+        assert r1 == r2
+
     def test_no_purchase_events_yields_empty(self):
         data = """\
 hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_country\tpagename\tpage_url\tproduct_list\treferrer
@@ -199,6 +221,33 @@ hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_c
         assert len(results) == 1
         assert results[0].keyword == "macbook"
         assert results[0].revenue == 500.0
+
+    def test_earliest_hit_partition_utc(self):
+        ts = int(datetime(2021, 1, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+        data = f"""\
+hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_country\tpagename\tpage_url\tproduct_list\treferrer
+{ts}\t2021-01-01 00:00:00\tMozilla\t1.1.1.1\t\tX\tY\tUS\tHome\thttp://x\t\thttp://www.google.com/search?q=a
+"""
+        analyzer = SearchKeywordAnalyzer()
+        analyzer.process_stream(io.StringIO(data))
+        tp = analyzer.earliest_hit_partition_utc()
+        assert tp is not None
+        assert tp.dt == "2021-01-01"
+        assert tp.hour == "00"
+        assert tp.minute_bucket == "00"
+
+    def test_earliest_hit_partition_respects_partition_interval_env(self, monkeypatch):
+        monkeypatch.setenv("PARTITION_INTERVAL_MINUTES", "10")
+        ts = int(datetime(2021, 1, 1, 0, 25, 0, tzinfo=timezone.utc).timestamp())
+        data = f"""\
+hit_time_gmt\tdate_time\tuser_agent\tip\tevent_list\tgeo_city\tgeo_region\tgeo_country\tpagename\tpage_url\tproduct_list\treferrer
+{ts}\t2021-01-01 00:25:00\tMozilla\t1.1.1.1\t\tX\tY\tUS\tHome\thttp://x\t\thttp://www.google.com/search?q=a
+"""
+        analyzer = SearchKeywordAnalyzer()
+        analyzer.process_stream(io.StringIO(data))
+        tp = analyzer.earliest_hit_partition_utc()
+        assert tp is not None
+        assert tp.minute_bucket == "20"
 
 
 # ── Output file ───────────────────────────────────────────────────
