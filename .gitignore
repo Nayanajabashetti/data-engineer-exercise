@@ -234,11 +234,17 @@ terraform/terraform.tfstate.backup
 terraform/terraform.tfvars
 terraform/lambda_payload.zip
 
+# Local cheat sheet (bucket names, commands) — do not commit
+commands-cheatsheet.local.md
+
 # Local AWS E2E (copy from .env.aws.example)
 .env.aws
 # E2E scripts — local TSV→Parquet temps (keep airflow/dags/lambda_smoke_sample.parquet tracked)
 .e2e_*.parquet
 .lambda_timing_*.parquet
+
+# Local BI HTML preview / download (not source)
+airflow/bi-report.html
 
 # Local Airflow runtime state
 .airflow/

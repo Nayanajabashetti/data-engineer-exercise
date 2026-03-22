@@ -105,9 +105,8 @@ For each visitor (tracked by IP + User-Agent composite key), the application rem
 
 ### Prerequisites
 
-- Python 3.10+ (`python3` on macOS; if `pip` is missing, use `python3 -m pip`)
-- **`requirements.txt`** is intentionally small (pytest, boto3, pyarrow, pg8000) so `pip install` works on macOS without compiling Airflow’s heavy deps (e.g. `google-re2` / Abseil).
-- For **local PySpark** or **Airflow** (DAG editing / IDE), install **`requirements-dev.txt`** instead (or use **Docker** under `airflow/`).
+- Python 3.10+
+- **PyArrow** — required for **Parquet** (local E2E TSV→Parquet, Lambda path input/output). Pinned in `requirements.txt` to match the **Lambda zip** built by Terraform (`pyarrow>=17.0,<19`).
 
 ### Install & Run
 
@@ -117,6 +116,21 @@ python3 -m src.main /path/to/data.tsv
 ```
 
 Output is written to `./output/YYYY-mm-dd_SearchKeywordPerformance.tab`.
+
+### PII (Personally Identifiable Information) Handling
+
+The analyzer automatically masks PII by default to ensure privacy compliance:
+
+**PII fields masked:**
+- **IP addresses**: `67.98.123.1` → `67.98.123.xxx`
+- **User agents**: Hashed to preserve uniqueness (`ua_1a2b3c4d`)
+- **Location data**: City/region masked, country preserved
+
+**To disable PII masking:**
+```python
+from src.search_keyword_analyzer import SearchKeywordAnalyzer
+analyzer = SearchKeywordAnalyzer(mask_pii=False)
+```
 
 ### Run Tests
 
@@ -251,7 +265,7 @@ Set **`glue_sync_db_sinks=true`** in Airflow Variables (and Terraform **`db_secr
    aws lambda update-function-configuration --function-name search-keyword-performance \
      --layers <LayerVersionArnFromPreviousCommand> --region us-west-2
    ```
-4. **Lambda + Parquet (optional)** — attach a **pyarrow** layer or bundle `pyarrow` if you want Parquet on the Lambda path (otherwise it falls back to `.tab`).
+4. **Lambda + Parquet** — **PyArrow is bundled by default** in the Terraform-built deployment zip (`pg8000` + `pyarrow` via Docker/Linux wheels in `terraform/main.tf`). No separate layer needed unless you change the packaging flow.
 5. **Smoke test** — `aws s3 cp sample_hit_data.tsv s3://<bucket>/input/demo.tsv` then check CloudWatch and `s3://<bucket>/output/`.
 6. **Airflow (local)** — see Docker section below; set **Admin → Variables** (`search_keyword_bucket`; use **`glue_sync_db_sinks`** only when RDS + IAM are ready; `db_*`; `db_verify_mode=auto` if needed).
 
@@ -361,7 +375,7 @@ This project is designed to be deployable and correct today. In a production set
 
 ### Phase 1 (Current Implementation)
 Base Layer that works and is deployable:
-1. **Small files**: S3-triggered **AWS Lambda** writes daily `.tab` results to `s3://<bucket>/output/`.
+1. **Small files**: S3-triggered **AWS Lambda** writes daily **Parquet** (and optional legacy paths) under **`s3://<bucket>/curated/...`** (see architecture above); local CLI still defaults to **`.tab`** under `./output/`.
 2. **Large files (10GB+)**: **Airflow + AWS Glue (Spark)** processes hit-level TSV at scale and writes aggregated results back to S3.
 3. **Orchestration**: Airflow coordinates Glue execution and performs a run-date scoped S3 output check.
 

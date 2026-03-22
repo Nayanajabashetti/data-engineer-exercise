@@ -51,6 +51,8 @@ class RevenueRecord:
     engine_domain: str
     keyword: str
     revenue: float
+    event_type: str = "purchase"  # purchase, return, exchange, support
+    post_purchase_impact: float = 0.0  # PPI score
 
 
 class SearchKeywordAnalyzer:
@@ -59,15 +61,64 @@ class SearchKeywordAnalyzer:
     report for traffic originating from external search engines.
     """
 
-    def __init__(self) -> None:
+    # PII handling configuration
+    PII_FIELDS = {"ip", "user_agent", "geo_city", "geo_region", "geo_country"}
+    
+    # PII redaction methods
+    @staticmethod
+    def _mask_ip(ip: str) -> str:
+        """Mask IP address to preserve network segment but hide host."""
+        parts = ip.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.xxx"
+        return "xxx.xxx.xxx.xxx"
+    
+    @staticmethod
+    def _mask_user_agent(ua: str) -> str:
+        """Hash user agent for privacy while preserving uniqueness."""
+        import hashlib
+        return f"ua_{hashlib.sha256(ua.encode()).hexdigest()[:8]}"
+    
+    @staticmethod
+    def _mask_location(city: str, region: str, country: str) -> tuple[str, str, str]:
+        """Mask location data to region level only."""
+        # Keep country, mask city/region to generic
+        return "masked_city", "masked_region", country or "unknown"
+    
+    def _mask_pii_row(self, row: dict[str, str]) -> dict[str, str]:
+        """Apply PII masking to a row if masking is enabled."""
+        if not self._mask_pii:
+            return row
+            
+        masked_row = row.copy()
+        
+        # Mask IP
+        if "ip" in masked_row:
+            masked_row["ip"] = self._mask_ip(masked_row["ip"])
+            
+        # Mask user agent
+        if "user_agent" in masked_row:
+            masked_row["user_agent"] = self._mask_user_agent(masked_row["user_agent"])
+            
+        # Mask location data
+        city = masked_row.get("geo_city", "")
+        region = masked_row.get("geo_region", "")
+        country = masked_row.get("geo_country", "")
+        if city or region or country:
+            masked_city, masked_region, masked_country = self._mask_location(city, region, country)
+            masked_row["geo_city"] = masked_city
+            masked_row["geo_region"] = masked_region
+            masked_row["geo_country"] = masked_country
+            
+        return masked_row
+
+    def __init__(self, mask_pii: bool = True) -> None:
         self._visitor_search: dict[str, SearchAttribution] = {}
         self._revenue: dict[tuple[str, str], float] = {}
+        self._ppi_scores: dict[tuple[str, str], float] = {}
         self._min_hit_ts: int | None = None
         self._max_hit_ts: int | None = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._mask_pii = mask_pii
 
     def process_file(self, path: str | Path) -> list[RevenueRecord]:
         """Read *path*, process all rows in time order, and return aggregated revenue records."""
@@ -89,20 +140,24 @@ class SearchKeywordAnalyzer:
     def process_stream(self, stream: IO[str]) -> list[RevenueRecord]:
         """Read from *stream*, sort hits by hit_time_gmt, and return aggregated revenue records.
 
-        Sorting ensures last-touch attribution is always time-ordered regardless of
-        whether the input file is pre-sorted, keeping behaviour aligned with the
-        Glue/Spark window-function implementation.
-        Sorting tolerates malformed or missing hit_time_gmt values by treating
-        them as 0, ensuring bad rows do not crash processing.
+        The function sorts all rows by hit_time_gmt to ensure consistent last-touch
+        attribution.  Malformed timestamps are treated as 0, ensuring bad rows do not
+        crash processing.
         """
 
         self._visitor_search.clear()
         self._revenue.clear()
+        self._ppi_scores.clear()
         self._min_hit_ts = None
         self._max_hit_ts = None
 
         reader = csv.DictReader(stream, delimiter="\t")
         rows = list(reader)
+        
+        # Apply PII masking to all rows if enabled
+        if self._mask_pii:
+            rows = [self._mask_pii_row(row) for row in rows]
+            
         rows.sort(key=self._safe_hit_timestamp)
         for row in rows:
             ts = self._safe_hit_timestamp(row)
@@ -157,6 +212,9 @@ class SearchKeywordAnalyzer:
                     row[key] = cell.decode("utf-8", errors="replace")
                 else:
                     row[key] = str(cell)
+            
+            # Apply PII masking to the row
+            row = self._mask_pii_row(row)
             rows.append(row)
 
         rows.sort(key=self._safe_hit_timestamp)

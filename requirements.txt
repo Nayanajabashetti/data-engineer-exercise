@@ -1,5 +1,6 @@
 # Core: local CLI, tests, AWS E2E (TSV→Parquet), Lambda/Glue code deps
 pytest>=7.0
 boto3>=1.28,<2.0
-pyarrow>=16.0
+# Align with Lambda bundle (terraform/main.tf Docker pip): pyarrow 17–19
+pyarrow>=17.0,<19
 pg8000>=1.31
