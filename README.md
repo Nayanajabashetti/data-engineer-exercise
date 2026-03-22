@@ -11,56 +11,78 @@ A Python application that parses Adobe Analytics hit-level data to determine how
 
 ## Architecture
 
+### Medallion-style layers (S3)
+
+| Layer | Names | Default prefix | Role |
+|-------|--------|----------------|------|
+| **Landing** | Raw, Bronze | `landing/` | Hit-level **Parquet** (same schema as legacy Adobe TSV). Lambda trigger + Glue read path. Use `glue_landing_format = "tsv"` only while migrating. |
+| **Staging** | Silver, intermediate curated | `staging/search_hits/` | Optional Glue output: **partitioned Parquet** hits (`dt`/`hour`/`minute`). |
+| **Curated** | Gold, cleansed, final | `curated/search_keyword/` | **Aggregated** keyword revenue Parquet; BI/Athena + optional RDS. |
+
+See **`docs/medallion_architecture.md`** and **`src/s3_data_layers.py`**. Terraform defaults use these prefixes; set `input_prefix`, `staging_prefix`, `output_prefix` to keep legacy `input/` / `output/` during migration.
+
 ```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                                  AWS Cloud                                        │
-│                                                                                   │
-│  ┌──────────┐ upload   ┌──────────┐  trigger   ┌─────────────┐                   │
-│  │ Hit-level │─────────▶│ S3       │──────────▶│ Lambda      │──┐                 │
-│  │ TSV file  │          │ input/   │            │ (Python)    │  │                 │
-│  └──────────┘          └────┬─────┘            └─────────────┘  │                 │
-│                             │                      │ .parquet │                 │
-│                             │ trigger              │ or .tab* │                 │
-│                             ▼                      └─────┬──────┘                 │
-│                      ┌───────────┐                     │                         │
-│                      │ Glue Job  │─────────────────────┤                         │
-│   (optional)         │ (Spark)   │                     │                         │
-│   Airflow ──────────▶└─────┬─────┘                     ▼                         │
-│   starts Glue job          │                    ┌──────────┐                    │
-│                            │                    │ S3       │                    │
-│                            └───────────────────▶│ output/  │                    │
-│                                                 │ Parquet  │                    │
-│                                                 └────┬─────┘                    │
-│                                                      │                          │
-│                           optional DB sinks          │ optional                 │
-│                           (same aggregated rows)     │ Athena / BI              │
-│                              ▼                       ▼                          │
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                                  AWS Cloud                                          │
+│                                                                                     │
+│  Upload Parquet  ┌──────────────┐  PutObject      ┌─────────────┐                  │
+│  ───────────────▶│ S3 Landing   │────────────────▶│ Lambda      │──┐               │
+│                  │ landing/     │                 │ → Curated   │  │               │
+│                  └──────┬───────┘                 └──────┬──────┘  │               │
+│                         │                               │ .parquet                 │
+│                         │  Airflow / manual             │                           │
+│                         ▼                               ▼                           │
+│                  ┌──────────────┐                 ┌──────────────┐                │
+│                  │ Glue (Spark) │──optional──────▶│ S3 Staging   │                │
+│                  │ reads Landing│   Parquet hits  │ staging/...  │                │
+│                  └──────┬───────┘                 └──────────────┘                │
+│                         │                                                         │
+│                         └──────────────────────▶┌──────────────┐                  │
+│                                                 │ S3 Curated   │                  │
+│                                                 │ curated/...  │                  │
+│                                                 └──────┬───────┘                  │
+│                          optional DB sinks             │ optional Athena / BI     │
+│                              ▼                         ▼                          │
 │                       ┌──────────────┐         ┌─────────────┐                    │
-│                       │ RDS Postgres │         │ Query       │                    │
-│                       │ fact + AI    │         │ Parquet in  │                    │
-│                       │ tables       │         │ S3 via DDL  │                    │
+│                       │ RDS Postgres │         │ Athena DDL  │                    │
 │                       └──────────────┘         └─────────────┘                    │
-└──────────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────────────────────┘
 
       OR (local development)
 
 ┌──────────┐             ┌──────────────────────┐            ┌──────────┐
-│ TSV file │────────────▶│ SearchKeywordAnalyzer │───────────▶│ .tab     │
-└──────────┘   CLI       │ (Python class)        │            │ output   │
+│ TSV file │────────────▶│ SearchKeywordAnalyzer │───────────▶│ ./output │
+└──────────┘   CLI       │ (Python class)        │            │ .tab     │
                          └──────────────────────┘            └──────────┘
 ```
 
-\*Lambda writes **Parquet** when `pyarrow` is available in the runtime; otherwise **tab-delimited** (same columns).
+\*Lambda bundles **PyArrow** (Terraform build) and writes **Parquet** only. Glue defaults to **`--landing_format parquet`**; set `glue_landing_format = "tsv"` in Terraform if landing files are still tab-separated.
 
 **Local mode**: CLI accepts a file path, writes output to `./output/`.
 
-**AWS Glue mode**: Reads hit-level TSV from S3 `input/`, aggregates in Spark, writes **Parquet** under `output/<date>_SearchKeywordPerformance/`. Optional **RDS PostgreSQL** sink for BI-style tables.
+**AWS Glue mode**: Reads **Landing** as **Parquet** by default (`spark.read.parquet`) or legacy TSV (`--landing_format tsv`). Optional **`--partition_dt`** / **`--partition_hour`** / **`--partition_minute`** narrow the read (see `docs/golden_path_compaction.md`). Writes **Curated** Parquet under `curated/search_keyword/<date>_SearchKeywordPerformance/` with **`coalesce(1)`**. Optionally writes **Staging** Parquet hits when **`--partitioned_hits_path`** is set. Optional **RDS** sink.
 
-**AWS Lambda mode**: S3 upload to `input/` triggers lightweight processing; writes **`output/<stem>_<date>_SearchKeywordPerformance.parquet`** (or `.tab` fallback). Optional **RDS** sink (same schema intent as Glue).
+**AWS Lambda mode**: S3 upload under **Landing** triggers processing (`.parquet` or legacy `.tsv`/`.tab`); writes **`curated/search_keyword/dt=.../hour=.../minute=.../<stem>_<date>_SearchKeywordPerformance.parquet`**. Set **`PARTITION_OUTPUT_KEYS=false`** for a flat key under curated. Optional **RDS** sink.
 
-**Orchestration**: **Apache Airflow** DAG can start the Glue job, wait for completion, verify S3 output, and optionally verify DB sinks (see `airflow/dags/`).
+### Time-based partitioning (UTC)
 
-**Analytics on S3**: Point **Amazon Athena** (or similar) at the **Parquet** prefixes under `output/` for ad-hoc SQL without loading files locally.
+`hit_time_gmt` is Unix **seconds** in **UTC**. Hive-style keys (human-readable **`minute`**, not opaque slot indices):
+
+| Key | Meaning |
+|-----|--------|
+| `dt` | Calendar day `YYYY-MM-DD` |
+| `hour` | Hour `00`–`23` |
+| `minute` | Bucket start (e.g. `00`–`45` when interval is **15**). Set by **`get_minute_bucket()`** in `partition_time.py` using **`PARTITION_INTERVAL_MINUTES`** (Lambda) / **`--partition_interval_minutes`** (Glue) / Terraform `partition_interval_minutes` — **one value, not scattered literals**. See **`docs/partition_interval.md`**. |
+
+**Storage vs logic:** Ingestors can land files under `dt/hour/minute` paths. Row-level **`hit_time_gmt`** still drives attribution and partition columns (late data routes to the correct `minute=` folder logically even if a file was dropped in the wrong prefix).
+
+**Pruning:** Prefer Glue args **`--partition_dt`** (Airflow defaults to **`ds`**) so reads target `landing/dt=<run-date>/` (or your `input_prefix`) instead of scanning the whole landing prefix. Optional hour/minute narrow further.
+
+**Compaction:** Run a separate scheduled job to merge many small Parquet parts — see **`docs/golden_path_compaction.md`**.
+
+**Orchestration**: **Apache Airflow** DAG can start the Glue job, wait for completion, verify S3 output under the **curated** prefix, and optionally verify DB sinks (see `airflow/dags/`). Set Airflow Variable **`search_keyword_bucket`**; default output prefix in the DAG matches **`curated/search_keyword/`**.
+
+**Analytics on S3**: Point **Amazon Athena** (or similar) at the **curated** Parquet paths for ad-hoc SQL.
 
 ### Attribution Model
 
@@ -75,17 +97,23 @@ For each visitor (tracked by IP + User-Agent composite key), the application rem
 | **Parallelism** | Single-threaded | Spark partitions across N workers |
 | **10 GB+ files** | Fails or requires complex chunking | Native -- just add workers |
 
+**Large Glue runs:** optional repartitioning, AQE/shuffle tuning, multi-file curated Parquet — **`docs/glue_spark_optimizations.md`** (Terraform `glue_*` variables).
+
+**Why ~60–90s for tiny files on Glue:** mostly Spark/Glue startup + executor + S3 listing — **`docs/glue_runtime_latency.md`**.
+
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.10+ (`python3` on macOS; if `pip` is missing, use `python3 -m pip`)
+- **`requirements.txt`** is intentionally small (pytest, boto3, pyarrow, pg8000) so `pip install` works on macOS without compiling Airflow’s heavy deps (e.g. `google-re2` / Abseil).
+- For **local PySpark** or **Airflow** (DAG editing / IDE), install **`requirements-dev.txt`** instead (or use Docker / MWAA).
 
 ### Install & Run
 
 ```bash
-pip install -r requirements.txt
-python -m src.main /path/to/data.tsv
+python3 -m pip install -r requirements.txt
+python3 -m src.main /path/to/data.tsv
 ```
 
 Output is written to `./output/YYYY-mm-dd_SearchKeywordPerformance.tab`.
@@ -98,7 +126,19 @@ pytest tests/ -v
 
 ## AWS Deployment (Terraform)
 
-### Deploy
+### Deploy (quick)
+
+From the **repo root** (uses `.env.aws` → `TF_VAR_bucket_name`, or use `terraform/terraform.tfvars`):
+
+```bash
+cp .env.aws.example .env.aws   # set DATA_BUCKET + AWS_REGION
+./scripts/terraform_apply.sh plan
+TF_APPLY_AUTO_APPROVE=1 ./scripts/terraform_apply.sh apply
+# Optional: apply + upload Airflow DAGs to S3 for MWAA
+SYNC_AIRFLOW_DAGS=1 ./scripts/deploy_aws.sh
+```
+
+Manual equivalent:
 
 ```bash
 cd terraform
@@ -107,9 +147,33 @@ terraform plan -var="bucket_name=my-search-keyword-data"
 terraform apply -var="bucket_name=my-search-keyword-data"
 ```
 
-**Lambda packaging:** `terraform apply` runs a local `null_resource` that copies `src/` and runs `python3 -m pip install pg8000==1.31.5 -t lambda_build/`, then zips the folder. Your machine needs **`python3` + `pip`** available on `PATH`.
+**End-to-end in AWS (Glue + Lambda)** after deploy:
+
+```bash
+python3 -m pip install -r requirements.txt   # local E2E: TSV → Parquet (PyArrow)
+cp .env.aws.example .env.aws   # set DATA_BUCKET + AWS_REGION
+./scripts/run_aws_e2e.sh
+```
+
+**Full step-by-step (Glue, Lambda, MWAA / Airflow):** **`docs/aws_runbook.md`** · **Open MWAA UI and trigger DAG:** **`docs/airflow_ui_quickstart.md`** · **Validator + sync + SSM:** **`docs/mwaa_ship_and_run.md`** (`./scripts/mwaa_preflight_and_sync.sh`) · **MWAA details:** **`docs/mwaa_deploy.md`**
+
+MWAA copy-paste:
+
+```bash
+export MWAA_ENV_NAME=your-mwaa-environment-name
+export DATA_BUCKET=acs-keyword-revenue-nayanaj
+export AWS_REGION=us-west-2
+./scripts/mwaa_preflight_and_sync.sh
+# Then: MWAA console → Open Airflow UI → search_keyword_glue_pipeline → Trigger
+```
+
+Or set `AWS_REGION` / `DATA_BUCKET` in the shell and run `scripts/e2e_aws.sh` and `scripts/lambda_timing_aws.sh` separately. See **`docs/aws_e2e_and_mwaa.md`**.
+
+**Lambda packaging:** `terraform apply` runs a local `null_resource` that copies `src/` and installs **`pg8000`** + **`pyarrow`** into `lambda_build/` (uses **Docker** `public.ecr.aws/lambda/python:3.12` when available for Linux wheels). Your machine needs **`python3` + `pip`**; **Docker** is strongly recommended on macOS.
 
 **Private RDS + Lambda:** set `lambda_subnet_ids` and `lambda_security_group_ids` (same VPC as RDS; SG must allow egress to RDS on 5432). Terraform attaches `AWSLambdaVPCAccessExecutionRole` when both lists are non-empty.
+
+**Heavy Glue jobs:** set `glue_enable_large_job_optimizations`, `glue_shuffle_partitions`, and optionally `glue_visitor_repartition_partitions` / `glue_curated_output_partitions` (see **`docs/glue_spark_optimizations.md`**).
 
 **Secrets Manager IAM:** when `enable_db_sinks=true` and `db_secret_arn` is set, Glue and Lambda roles get **`GetSecretValue` only on that ARN** (no `*`).
 
@@ -120,6 +184,21 @@ This creates:
 - A Glue ETL job (`glue_job.py` uploaded to S3)
 - IAM roles with scoped S3 + (optional) Secrets access
 - An optional S3-triggered Lambda function (zip includes **`pg8000`** via the build step above)
+- **Optional:** Amazon MWAA (Airflow) — `enable_mwaa=true`, VPC + subnets; **`airflow/requirements.txt`** uploaded to S3 for `pg8000` (DB verify). See **`docs/mwaa_deploy.md`**.
+
+### Apache Airflow on Amazon MWAA (optional)
+
+**Goal: only use the Airflow UI to trigger runs** → **`docs/airflow_ui_quickstart.md`**.
+
+After `terraform apply` with **`enable_mwaa=true`** (wait until status **AVAILABLE**), sync DAGs and open the UI:
+
+```bash
+cd terraform && terraform output -raw mwaa_webserver_url && cd ..
+export DATA_BUCKET=my-search-keyword-data
+./scripts/deploy_mwaa.sh
+```
+
+In the Airflow UI: set Variable **`search_keyword_bucket`**, configure Connection **`aws_default`** (region), enable DAG **`search_keyword_glue_pipeline`**, then trigger a run. Details: **`docs/mwaa_deploy.md`**.
 
 ### Store secrets in SSM Parameter Store (SecureString)
 
@@ -157,6 +236,10 @@ The Lambda path writes a Parquet file directly to:
 An example Airflow DAG is provided at:
 `airflow/dags/search_keyword_pipeline_dag.py`
 
+**AWS (MWAA):** Optional Terraform deploys [Amazon MWAA](https://aws.amazon.com/managed-workflows-for-apache-airflow/) using the same data bucket for DAGs (`airflow/dags/` by default). Set `enable_mwaa=true` plus VPC and private subnets. Then sync DAGs with `scripts/sync_airflow_dags_to_s3.sh` and configure Variables in the Airflow UI. See **`docs/aws_e2e_and_mwaa.md`**.
+
+**Glue + S3 smoke test in AWS:** `scripts/e2e_aws.sh` (uploads sample data, runs Glue, checks curated output). Same doc.
+
 It performs:
 1. Trigger Glue job
 2. Wait for Glue completion
@@ -165,11 +248,13 @@ It performs:
 
 ### Airflow dependencies
 
-Install Amazon provider in your Airflow environment:
+For a **local** Airflow venv (optional):
 
 ```bash
-pip install apache-airflow-providers-amazon
+python3 -m pip install -r requirements-dev.txt
 ```
+
+On MWAA, providers are preinstalled; extra packages go in **`airflow/requirements.txt`** (see **`docs/mwaa_deploy.md`**).
 
 Configure Airflow connection `aws_default` with AWS credentials/region, then trigger DAG `search_keyword_glue_pipeline`.
 
@@ -266,7 +351,8 @@ Lambda (small-file path) output is written as:
 ```
 search-keyword-performance/
 ├── README.md
-├── requirements.txt
+├── requirements.txt          # core + E2E (small)
+├── requirements-dev.txt    # optional: PySpark + Airflow
 ├── airflow/
 │   └── dags/
 │       └── search_keyword_pipeline_dag.py # Glue orchestration DAG

@@ -1,0 +1,11 @@
+# Optional: PySpark + Airflow (large; may need wheels or Docker on macOS).
+# Install with: python3 -m pip install -r requirements-dev.txt
+#
+# If you see errors building google-re2 / absl on Apple Silicon or Xcode Python,
+# use a newer Python from python.org or Homebrew, or run Airflow in Docker (see README).
+
+-r requirements.txt
+
+pyspark>=3.4
+apache-airflow>=2.9,<3.0
+apache-airflow-providers-amazon>=8.0

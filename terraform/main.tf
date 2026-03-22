@@ -31,13 +31,21 @@ resource "null_resource" "lambda_bundle" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command       = <<-EOT
+    command     = <<-EOT
       set -e
       BUILD="${path.module}/lambda_build"
       rm -rf "$BUILD"
       mkdir -p "$BUILD"
       cp -R "${path.module}/../src/"* "$BUILD/"
-      python3 -m pip install pg8000==1.31.5 -t "$BUILD" --no-cache-dir
+      # Linux wheels for Lambda (x86_64). On Apple Silicon, plain pip can install wrong arch.
+      if command -v docker >/dev/null 2>&1; then
+        # Lambda image ENTRYPOINT expects a handler; override so we only run pip.
+        docker run --platform linux/amd64 --rm -v "$BUILD:/var/task" \
+          --entrypoint /bin/bash public.ecr.aws/lambda/python:3.12 \
+          -c "pip install pg8000==1.31.5 'pyarrow>=17.0,<19' -t /var/task --no-cache-dir"
+      else
+        python3 -m pip install pg8000==1.31.5 "pyarrow>=17.0,<19" -t "$BUILD" --no-cache-dir
+      fi
     EOT
   }
 }
@@ -71,6 +79,17 @@ resource "aws_s3_bucket_versioning" "data_versioning" {
   }
 }
 
+# Spark/Hadoop may create S3 placeholder keys like "staging_$folder$" before writing
+# "staging/search_hits/dt=.../...". IAM must allow PutObject on that key; a rule for only
+# "staging/search_hits/*" does not match "staging_$folder$".
+locals {
+  glue_staging_top_prefix_arn = (
+    trim(var.staging_prefix, "/") != ""
+    ? "${aws_s3_bucket.data.arn}/${element(split("/", trim(var.staging_prefix, "/")), 0)}*"
+    : null
+  )
+}
+
 resource "aws_s3_object" "glue_script" {
   bucket = aws_s3_bucket.data.id
   key    = "scripts/glue_job.py"
@@ -92,20 +111,33 @@ resource "aws_glue_job" "analyzer" {
     python_version  = "3"
   }
 
-  default_arguments = {
-    "--input_path"                       = "s3://${aws_s3_bucket.data.id}/${var.input_prefix}"
-    "--output_path"                      = "s3://${aws_s3_bucket.data.id}/${var.output_prefix}"
-    "--job-language"                     = "python"
-    "--enable-continuous-cloudwatch-log" = "true"
-    "--additional-python-modules"        = "pg8000==1.31.5"
-    "--sync_db_sinks"                    = var.enable_db_sinks ? "true" : "false"
-    "--db_host"                          = var.db_host
-    "--db_port"                          = tostring(var.db_port)
-    "--db_name"                          = var.db_name
-    "--db_secret_arn"                    = var.db_secret_arn
-    "--db_fact_table"                    = var.db_fact_table
-    "--db_ai_table"                      = var.db_ai_table
-  }
+  default_arguments = merge(
+    {
+      "--input_path"                       = "s3://${aws_s3_bucket.data.id}/${var.input_prefix}"
+      "--output_path"                      = "s3://${aws_s3_bucket.data.id}/${var.output_prefix}"
+      "--partition_interval_minutes"       = tostring(var.partition_interval_minutes)
+      "--job-language"                     = "python"
+      "--enable-continuous-cloudwatch-log" = "true"
+      "--additional-python-modules"        = "pg8000==1.31.5"
+      "--sync_db_sinks"                    = var.enable_db_sinks ? "true" : "false"
+      "--db_host"                          = var.db_host
+      "--db_port"                          = tostring(var.db_port)
+      "--db_name"                          = var.db_name
+      "--db_secret_arn"                    = var.db_secret_arn
+      "--db_fact_table"                    = var.db_fact_table
+      "--db_ai_table"                      = var.db_ai_table
+    },
+    var.staging_prefix != "" ? { "--partitioned_hits_path" = "s3://${aws_s3_bucket.data.id}/${var.staging_prefix}" } : {},
+    {
+      "--enable_large_job_optimizations" = var.glue_enable_large_job_optimizations ? "true" : "false"
+      "--shuffle_partitions"             = tostring(var.glue_shuffle_partitions)
+      "--curated_output_partitions"      = tostring(var.glue_curated_output_partitions)
+      "--visitor_repartition_partitions" = tostring(var.glue_visitor_repartition_partitions)
+      "--staging_repartition_partitions" = tostring(var.glue_staging_repartition_partitions)
+      "--s3_recursive_list"              = var.glue_s3_recursive_list ? "true" : "false"
+      "--landing_format"                 = var.glue_landing_format
+    }
+  )
 
   number_of_workers = var.glue_worker_count
   worker_type       = var.glue_worker_type
@@ -170,13 +202,17 @@ resource "aws_iam_role_policy" "glue_s3_access" {
           "s3:PutObject",
           "s3:DeleteObject",
         ]
-        Resource = [
-          # Normal outputs (e.g., output/2026-03-19_SearchKeywordPerformance/...)
-          "${aws_s3_bucket.data.arn}/${var.output_prefix}*",
-          # Some Spark/S3 integrations may attempt to write a legacy folder-marker
-          # object like output_$folder$ at the bucket root.
-          "${aws_s3_bucket.data.arn}/output*",
-        ]
+        Resource = concat(
+          [
+            "${aws_s3_bucket.data.arn}/${var.output_prefix}*",
+            "${aws_s3_bucket.data.arn}/output*",
+            "${aws_s3_bucket.data.arn}/curated*",
+          ],
+          trim(var.staging_prefix, "/") != "" ? [
+            "${aws_s3_bucket.data.arn}/${var.staging_prefix}*",
+            local.glue_staging_top_prefix_arn,
+          ] : []
+        )
       }
     ]
   })
@@ -309,15 +345,16 @@ resource "aws_lambda_function" "analyzer" {
 
   environment {
     variables = {
-      OUTPUT_PREFIX            = var.output_prefix
-      API_KEY_PARAM            = var.ssm_parameter_name
-      SYNC_DB_SINKS            = var.enable_db_sinks ? "true" : "false"
-      DB_HOST                  = var.db_host
-      DB_PORT                  = tostring(var.db_port)
-      DB_NAME                  = var.db_name
-      DB_SECRET_ARN            = var.db_secret_arn
-      DB_FACT_TABLE            = var.db_fact_table
-      DB_AI_TABLE              = var.db_ai_table
+      OUTPUT_PREFIX              = var.output_prefix
+      PARTITION_INTERVAL_MINUTES = tostring(var.partition_interval_minutes)
+      API_KEY_PARAM              = var.ssm_parameter_name
+      SYNC_DB_SINKS              = var.enable_db_sinks ? "true" : "false"
+      DB_HOST                    = var.db_host
+      DB_PORT                    = tostring(var.db_port)
+      DB_NAME                    = var.db_name
+      DB_SECRET_ARN              = var.db_secret_arn
+      DB_FACT_TABLE              = var.db_fact_table
+      DB_AI_TABLE                = var.db_ai_table
     }
   }
 }

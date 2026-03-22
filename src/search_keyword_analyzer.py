@@ -12,12 +12,18 @@ Attribution model:
 from __future__ import annotations
 
 import csv
+import io
 import logging
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import IO
 from urllib.parse import parse_qs, urlparse
+
+try:
+    from src.partition_time import TimePartition, partition_from_unix_seconds
+except ImportError:  # pragma: no cover - Lambda zip layout
+    from partition_time import TimePartition, partition_from_unix_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,8 @@ class SearchKeywordAnalyzer:
     def __init__(self) -> None:
         self._visitor_search: dict[str, SearchAttribution] = {}
         self._revenue: dict[tuple[str, str], float] = {}
+        self._min_hit_ts: int | None = None
+        self._max_hit_ts: int | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,6 +73,18 @@ class SearchKeywordAnalyzer:
         """Read *path*, process all rows in time order, and return aggregated revenue records."""
         with open(path, encoding="utf-8") as fh:
             return self.process_stream(fh)
+
+    @staticmethod
+    def _safe_hit_timestamp(row: dict[str, str]) -> int:
+        raw = (row.get("hit_time_gmt") or "").strip()
+        if not raw:
+            return 0
+        if raw.isdigit():
+            try:
+                return int(raw)
+            except ValueError:
+                return 0
+        return 0
 
     def process_stream(self, stream: IO[str]) -> list[RevenueRecord]:
         """Read from *stream*, sort hits by hit_time_gmt, and return aggregated revenue records.
@@ -76,23 +96,84 @@ class SearchKeywordAnalyzer:
         them as 0, ensuring bad rows do not crash processing.
         """
 
-        def _safe_hit_timestamp(row: dict[str, str]) -> int:
-            raw = (row.get("hit_time_gmt") or "").strip()
-            if not raw:
-                return 0
-            if raw.isdigit():
-                try:
-                    return int(raw)
-                except ValueError:
-                    return 0
-            return 0
+        self._visitor_search.clear()
+        self._revenue.clear()
+        self._min_hit_ts = None
+        self._max_hit_ts = None
 
         reader = csv.DictReader(stream, delimiter="\t")
         rows = list(reader)
-        rows.sort(key=_safe_hit_timestamp)
+        rows.sort(key=self._safe_hit_timestamp)
         for row in rows:
+            ts = self._safe_hit_timestamp(row)
+            if self._min_hit_ts is None or ts < self._min_hit_ts:
+                self._min_hit_ts = ts
+            if self._max_hit_ts is None or ts > self._max_hit_ts:
+                self._max_hit_ts = ts
             self._process_row(row)
         return self._build_sorted_results()
+
+    def process_parquet_bytes(self, data: bytes) -> list[RevenueRecord]:
+        """
+        Read a Parquet buffer (Apache Arrow / PyArrow), normalize columns to the same
+        names as the TSV path, sort by ``hit_time_gmt``, and aggregate.
+
+        Required columns (case-insensitive): ``hit_time_gmt``, ``ip``, ``user_agent``,
+        ``referrer``, ``event_list``, ``product_list``. Other columns are ignored.
+        """
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as e:
+            raise RuntimeError(
+                "Parquet input requires pyarrow. Install pyarrow in the Lambda deployment package."
+            ) from e
+
+        table = pq.read_table(io.BytesIO(data))
+        if table.num_rows == 0:
+            return []
+
+        col_map = {n.lower(): n for n in table.column_names}
+        required = ("hit_time_gmt", "ip", "user_agent", "referrer", "event_list", "product_list")
+        missing = [c for c in required if c not in col_map]
+        if missing:
+            raise ValueError(
+                f"Parquet input missing columns {missing}; found {list(table.column_names)}"
+            )
+
+        self._visitor_search.clear()
+        self._revenue.clear()
+        self._min_hit_ts = None
+        self._max_hit_ts = None
+
+        rows: list[dict[str, str]] = []
+        for i in range(table.num_rows):
+            row: dict[str, str] = {}
+            for orig in table.column_names:
+                key = orig.lower()
+                cell = table.column(orig)[i].as_py()
+                if cell is None:
+                    row[key] = ""
+                elif isinstance(cell, bytes):
+                    row[key] = cell.decode("utf-8", errors="replace")
+                else:
+                    row[key] = str(cell)
+            rows.append(row)
+
+        rows.sort(key=self._safe_hit_timestamp)
+        for row in rows:
+            ts = self._safe_hit_timestamp(row)
+            if self._min_hit_ts is None or ts < self._min_hit_ts:
+                self._min_hit_ts = ts
+            if self._max_hit_ts is None or ts > self._max_hit_ts:
+                self._max_hit_ts = ts
+            self._process_row(row)
+        return self._build_sorted_results()
+
+    def earliest_hit_partition_utc(self) -> TimePartition | None:
+        """Hive-style UTC partition from the earliest hit_time_gmt in the last process_stream run."""
+        if self._min_hit_ts is None:
+            return None
+        return partition_from_unix_seconds(self._min_hit_ts)
 
     def write_output(self, records: list[RevenueRecord], output_dir: str | Path = ".") -> Path:
         """Write the tab-delimited output file and return its path."""
