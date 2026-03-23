@@ -223,6 +223,9 @@ output/
 sample_hit_data.tsv
 SearchKeywordPerformance*.tab
 
+# Editor / Vim
+*.swp
+
 # macOS
 .DS_Store
 
