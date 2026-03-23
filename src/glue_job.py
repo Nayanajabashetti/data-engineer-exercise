@@ -67,6 +67,12 @@ def _validate_pg_identifier(name: str, label: str) -> str:
     return name
 
 
+# NOTE: SEARCH_ENGINE_QUERY_PARAMS is hardcoded for this demonstration to ensure
+# the Glue script stays self-contained when uploaded to S3 (no import from src/).
+#
+# Production scaling strategy:
+# In a high-volume environment (1,000+ engines), move this mapping to an external
+# metadata store (e.g., AWS AppConfig or S3-backed JSON) for updates without redeploy.
 SEARCH_ENGINE_QUERY_PARAMS = {
     "google": ["q"],
     "bing": ["q"],

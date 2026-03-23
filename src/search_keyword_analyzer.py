@@ -27,6 +27,14 @@ except ImportError:  # pragma: no cover - Lambda zip layout
 
 logger = logging.getLogger(__name__)
 
+# NOTE: SEARCH_ENGINE_QUERY_PARAMS is hardcoded for this demonstration to ensure
+# the script remains self-contained and "zero-dependency" for reviewers.
+#
+# Production scaling strategy:
+# In a high-volume environment (1,000+ engines), this mapping should be
+# moved to an external metadata store (e.g., AWS AppConfig or S3-backed JSON).
+# That decouples business logic from configuration and allows real-time
+# updates without a code redeployment.
 SEARCH_ENGINE_QUERY_PARAMS: dict[str, list[str]] = {
     "google": ["q"],
     "bing": ["q"],
